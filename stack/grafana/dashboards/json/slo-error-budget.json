@@ -1,0 +1,249 @@
+{
+  "uid": "obs-slo-budget",
+  "title": "orders-api / SLO Error Budget",
+  "description": "Availability + latency SLO status for orders-api: current SLI vs. target, remaining error budget, the multi-window burn-rate ladder, and 30-day compliance. See docs/slo-guide.md and stack/prometheus/rules/slo-alerts.yaml for the full derivation behind every number on this page.",
+  "tags": ["orders-api", "slo", "k8s-observability-stack"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "editable": true,
+  "graphTooltip": 1,
+  "annotations": { "list": [] },
+  "templating": {
+    "list": [
+      {
+        "name": "slo",
+        "type": "custom",
+        "label": "SLO",
+        "query": "availability,latency",
+        "current": { "text": "availability", "value": "availability" },
+        "multi": false
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Current SLI vs. 99.9% / 99% target (30d)",
+      "type": "gauge",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Honest only once the cluster is older than 30 days — this repo's 7d Prometheus retention means this number is 7d-weighted on a young cluster. See docs/slo-guide.md section 4.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0.99,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.995 },
+              { "color": "green", "value": 0.999 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "1 - job:slo_availability_errors:ratio_rate30d{job=\"orders-api\"}",
+          "legendFormat": "availability SLI (30d)",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "1 - job:slo_latency_errors:ratio_rate30d{job=\"orders-api\"}",
+          "legendFormat": "latency SLI (30d)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Error budget remaining (30d, availability)",
+      "type": "gauge",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "100% = full 43m12s/month budget untouched. 0% = budget exhausted; see slo/README.md's error-budget policy for what happens next.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.2 },
+              { "color": "green", "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "1 - (job:slo_availability_errors:ratio_rate30d{job=\"orders-api\"} / 0.001)",
+          "legendFormat": "budget remaining",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "30-day compliance",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0.999 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "1 - job:slo_availability_errors:ratio_rate30d{job=\"orders-api\"}",
+          "legendFormat": "compliant",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Burn rate ladder (availability) — 1h window",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Burn rate = error ratio / (1 - SLO target). Horizontal lines mark the four paging/ticket rungs derived in stack/prometheus/rules/slo-alerts.yaml: 14.4x and 6x page, 3x and 1x open a ticket.",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": { "drawStyle": "line", "fillOpacity": 5 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "transparent", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "orange", "value": 3 },
+              { "color": "semi-dark-orange", "value": 6 },
+              { "color": "red", "value": 14.4 }
+            ]
+          },
+          "custom-thresholdsStyle": { "mode": "line" }
+        },
+        "overrides": []
+      },
+      "options": { "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "job:slo_availability_errors:ratio_rate1h{job=\"orders-api\"} / 0.001",
+          "legendFormat": "1h burn rate",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "job:slo_availability_errors:ratio_rate5m{job=\"orders-api\"} / 0.001",
+          "legendFormat": "5m burn rate (confirms)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Burn rate ladder (availability) — 6h/1d/3d windows",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "none", "custom": { "drawStyle": "line", "fillOpacity": 5 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "job:slo_availability_errors:ratio_rate6h{job=\"orders-api\"} / 0.001",
+          "legendFormat": "6h burn rate",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "job:slo_availability_errors:ratio_rate1d{job=\"orders-api\"} / 0.001",
+          "legendFormat": "1d burn rate",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "job:slo_availability_errors:ratio_rate3d{job=\"orders-api\"} / 0.001",
+          "legendFormat": "3d burn rate",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Budget burn-down over time (minutes remaining of 43.2)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "43.2 minutes is the full 30-day availability budget (0.1% of 43,200 minutes). This line trending toward zero before the 30-day window ends is the signal the error-budget policy in slo/README.md acts on.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 17 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "m",
+          "custom": { "drawStyle": "line", "fillOpacity": 10 },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": null }] }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "43.2 * (1 - (job:slo_availability_errors:ratio_rate30d{job=\"orders-api\"} / 0.001))",
+          "legendFormat": "minutes of budget remaining",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Latency SLO: fraction of requests over 300ms",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "job:slo_latency_errors:* is a bucket-boundary count (le=\"0.3\"), not histogram_quantile — see docs/slo-guide.md section 5 for why that distinction is load-bearing for SLO correctness.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 17 },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "job:slo_latency_errors:ratio_rate1h{job=\"orders-api\"}",
+          "legendFormat": "1h",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "job:slo_latency_errors:ratio_rate5m{job=\"orders-api\"}",
+          "legendFormat": "5m",
+          "refId": "B"
+        }
+      ]
+    }
+  ]
+}

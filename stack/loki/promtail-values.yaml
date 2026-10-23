@@ -1,0 +1,149 @@
+# promtail-values.yaml — Helm values for `grafana/promtail`, the DaemonSet
+# that tails every container's log file on each node and ships parsed lines
+# to Loki.
+#
+#   helm repo add grafana https://grafana.github.io/helm-charts
+#   helm upgrade --install promtail grafana/promtail -n monitoring -f stack/loki/promtail-values.yaml
+#
+# Promtail runs as a DaemonSet (one pod per node) with a hostPath mount onto
+# /var/log/pods — that is how it is able to read container logs without going
+# through the kubelet or container runtime's own log API.
+config:
+  clients:
+    - url: http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push
+
+  snippets:
+    # -------------------------------------------------------------------
+    # scrapeConfigs is where the actual work happens: Kubernetes service
+    # discovery finds every container, and `pipeline_stages` below transforms
+    # each raw line before it is shipped. Stages run TOP TO BOTTOM, each one
+    # operating on the output of the previous one.
+    # -------------------------------------------------------------------
+    pipelineStages:
+      # STAGE 1 — cri: parse the CRI (containerd) log line format.
+      #
+      # Every line on disk looks like:
+      #   2024-01-15T10:23:45.123456789Z stdout F {"time":"...","level":"INFO",...}
+      # (timestamp, stream, a P/F partial/full flag, then the CONTAINER's own
+      # log line). The `cri` stage is a shortcut for the regex that splits
+      # those four fields apart — without it, every downstream stage would be
+      # matching against the whole CRI-wrapped line instead of just the JSON
+      # the application actually wrote.
+      - cri: {}
+
+      # STAGE 2 — json: parse the application's own JSON log line (the part
+      # `cri` just extracted) and pull specific fields out into named
+      # pipeline variables. This matches EXACTLY the shape newLogger() in
+      # app/main.go produces via slog.NewJSONHandler: a "time", "level",
+      # "msg", "service", "trace_id", "span_id" and so on, all top-level
+      # keys.
+      - json:
+          expressions:
+            level: level
+            msg: msg
+            trace_id: trace_id
+            span_id: span_id
+            route: route
+            status: status
+            service: service
+
+      # STAGE 3 — labels: promote a SMALL, BOUNDED subset of the extracted
+      # fields to actual Loki labels (which define streams and are indexed).
+      # Only `level` and `service` qualify — handful of values each. Loki's
+      # own cardinality rule is identical in spirit to Prometheus's: labels
+      # define streams, and a stream per unique value is fine for ~10 values,
+      # ruinous for thousands. See the next stage for why trace_id, route and
+      # status are deliberately NOT here.
+      - labels:
+          level:
+          service:
+
+      # STAGE 4 — timestamp: use the APPLICATION's own timestamp (the `time`
+      # field, which newLogger() formats as RFC3339 with milliseconds)
+      # instead of the time Promtail happened to read the line. This matters
+      # under any backpressure: if Promtail falls behind by thirty seconds
+      # during a burst, every line in that burst would otherwise be stamped
+      # with the SAME late arrival time, destroying the ability to see
+      # request ordering in Loki.
+      - timestamp:
+          source: time
+          format: RFC3339Nano
+
+      # STAGE 5 — output: tells Promtail which extracted field is "the log
+      # line" for display/search purposes. Keeping the full original JSON
+      # rather than re-serialising a subset means LogQL's `| json` pipeline
+      # stage (used in docs/logql-cookbook.md) can still parse any field —
+      # nothing is thrown away, only re-labelled.
+      # (No explicit `output` stage needed here because `cri` already set the
+      # line to the application's raw JSON; this comment documents that
+      # implicit behaviour rather than overriding it.)
+
+      # -----------------------------------------------------------------
+      # THE CORRELATION STAGE — this is the one that matters most.
+      #
+      # trace_id is DELIBERATELY NOT a Loki label (stage 3 above) — one label
+      # value per trace would create one stream per request and take the
+      # index down exactly like an unbounded Prometheus label would. Instead
+      # it stays a structured field in the log BODY, extracted by stage 2's
+      # `json` block into the `trace_id` pipeline variable above so that:
+      #
+      #   1. LogQL queries can filter on it with `| trace_id = "<id>"`
+      #      (see docs/logql-cookbook.md) without it ever being a label.
+      #   2. Grafana's Loki datasource `derivedFields` config
+      #      (stack/grafana/datasources/datasources.yaml) regex-matches
+      #      trace_id straight out of the raw log line text and renders it as
+      #      a clickable link into Tempo — no Promtail-side action needed for
+      #      that half of the correlation; it is purely a Grafana datasource
+      #      feature operating on the line Promtail already shipped.
+      #
+      # In other words: Promtail's job here is just to make sure trace_id
+      # SURVIVES into the shipped line untouched. The actual link-rendering
+      # magic is entirely in the Grafana datasource config, not here.
+      # -----------------------------------------------------------------
+
+      # STAGE 6 — drop: filter out noisy, low-value lines BEFORE they are
+      # shipped to Loki, to keep ingestion volume and the resulting index
+      # small. Health/readiness probe traffic is excluded from the SLO (see
+      # docs/slo-guide.md) for the same reason it is dropped here: high
+      # frequency, synthetic, and carries no information once you already
+      # know the probe succeeded (readinessProbe failures surface as
+      # PodNotReady in Prometheus, not as a log line worth indexing).
+      - drop:
+          expression: '.*"route":"/healthz".*'
+          drop_counter_reason: "noisy_healthcheck_log"
+      - drop:
+          expression: '.*"route":"/readyz".*'
+          drop_counter_reason: "noisy_healthcheck_log"
+
+  # -------------------------------------------------------------------
+  # snippets.extraRelabelConfigs — Kubernetes-side labels (distinct from the
+  # pipeline_stages labels above, which come from the LOG CONTENT). These are
+  # the standard "which pod/namespace/container did this come from" labels
+  # every dashboard and alert in this repo assumes exist.
+  # -------------------------------------------------------------------
+  extraRelabelConfigs:
+    - source_labels: [__meta_kubernetes_namespace]
+      target_label: namespace
+    - source_labels: [__meta_kubernetes_pod_name]
+      target_label: pod
+    - source_labels: [__meta_kubernetes_pod_container_name]
+      target_label: container
+    - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+      target_label: app
+
+# --- Resources -----------------------------------------------------------
+# One Promtail pod per node; on a single-node minikube that is one pod,
+# sized generously for its trivial job.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+# Self-monitoring, same rationale as Loki's own ServiceMonitor above.
+serviceMonitor:
+  enabled: true
+  labels:
+    release: kube-prometheus-stack

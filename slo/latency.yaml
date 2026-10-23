@@ -1,0 +1,111 @@
+# latency.yaml — declarative SLO definition: orders-api latency.
+#
+# Same OpenSLO/Sloth-compatible shape as availability.yaml — see that file's
+# header comment for the full rationale on why this shape was chosen and how
+# it relates to the hand-written PrometheusRules this repo actually runs.
+apiVersion: openslo/v1
+kind: SLO
+metadata:
+  name: orders-api-latency
+  displayName: "orders-api — Latency"
+spec:
+  service: orders-api
+  description: >
+    99% of requests to /api/orders and /api/checkout complete in under
+    300ms, measured over a rolling 30-day window. 300ms is not an
+    arbitrary round number: it is an EXACT boundary
+    (le="0.3") in http_request_duration_seconds's bucket layout
+    (app/main.go), chosen specifically because an SLO threshold that does
+    not land on a bucket boundary cannot be measured exactly — see
+    docs/slo-guide.md section 5.
+
+  # --- SLI: bucket-boundary count, NOT histogram_quantile --------------------
+  # histogram_quantile() interpolates inside whichever bucket a percentile
+  # lands in, which makes it a good ESTIMATE of "what is the p99" but a poor
+  # tool for an SLI that must answer a yes/no "was this request within
+  # budget" for every single request. Counting the exact le="0.3" bucket's
+  # rate against the overall count rate answers that precisely, with zero
+  # interpolation error, as long as 0.3 is an actual bucket boundary.
+  indicator:
+    thresholdMetric:
+      metricSource:
+        type: prometheus
+        spec:
+          # "Bad" = requests NOT within the le="0.3" bucket.
+          errorQuery: |
+            sum(rate(http_request_duration_seconds_count{job="orders-api",
+                route=~"/api/orders|/api/checkout"}[{{.window}}]))
+            -
+            sum(rate(http_request_duration_seconds_bucket{job="orders-api",
+                route=~"/api/orders|/api/checkout", le="0.3"}[{{.window}}]))
+          totalQuery: |
+            sum(rate(http_request_duration_seconds_count{job="orders-api",
+                route=~"/api/orders|/api/checkout"}[{{.window}}]))
+
+  objectives:
+    - displayName: "99% under 300ms"
+      target: 0.99
+      op: gt
+
+  timeWindow:
+    - duration: 30d
+      isRolling: true
+
+  budgetingMethod: Occurrences
+
+  # --- Alerting: identical ladder shape to availability.yaml, but against
+  # (1 - 0.99) = 0.01 instead of (1 - 0.999) = 0.001 — ten times looser
+  # thresholds in absolute terms, because the latency budget itself is ten
+  # times bigger (1% vs 0.1% of traffic allowed to be "bad"). See
+  # stack/prometheus/rules/slo-alerts.yaml's "slo.latency.rules" group for
+  # the exact PromQL.
+  alertPolicies:
+    - alertMethod: pagerduty-critical
+      conditions:
+        - kind: burnrate
+          op: gt
+          threshold: 14.4
+          lookbackWindow: 1h
+          longWindow: 1h
+          shortWindow: 5m
+          severity: critical
+          page: true
+        - kind: burnrate
+          op: gt
+          threshold: 6
+          lookbackWindow: 6h
+          longWindow: 6h
+          shortWindow: 30m
+          severity: critical
+          page: true
+    - alertMethod: slack-warning
+      conditions:
+        - kind: burnrate
+          op: gt
+          threshold: 3
+          lookbackWindow: 1d
+          longWindow: 1d
+          shortWindow: 2h
+          severity: warning
+          page: false
+        - kind: burnrate
+          op: gt
+          threshold: 1
+          lookbackWindow: 3d
+          longWindow: 3d
+          shortWindow: 6h
+          severity: warning
+          page: false
+
+  # (1 - 0.99) x 30 days x 24h x 60m = 432 minutes = 7h12m. Ten times looser
+  # than the availability budget, deliberately — a slow response is a worse
+  # experience than a 404, but a much better one than a 500.
+  errorBudget:
+    totalMinutesPer30Days: 432
+    policy: see slo/README.md#the-error-budget-policy
+
+  labels:
+    team: orders
+    tier: "1"
+    runbook: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/ErrorBudgetBurn.md"
+    dashboard: "http://localhost:3000/d/obs-slo-budget"

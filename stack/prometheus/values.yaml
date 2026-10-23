@@ -1,0 +1,339 @@
+# values.yaml — Helm values for the `kube-prometheus-stack` chart.
+#
+#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+#     -n monitoring --create-namespace -f stack/prometheus/values.yaml
+#
+# (scripts/install-stack.ps1 / .sh already do this for you.)
+#
+# Everything here is sized for a LAPTOP minikube cluster
+# (`minikube start --cpus=4 --memory=8192`), not for production. Every
+# resources: block is a conscious trade against "what fits next to Loki,
+# Tempo, Grafana AND the orders-api demo app on one 8GB node". Comments below
+# flag what you would change for a real cluster.
+# ---------------------------------------------------------------------------
+
+# =============================================================================
+# THE SINGLE MOST IMPORTANT SETTING IN THIS FILE
+# =============================================================================
+# By default, the `Prometheus` custom resource that this chart creates
+# restricts which ServiceMonitor/PodMonitor objects it will adopt to those
+# carrying the label `release: kube-prometheus-stack` (the Helm release name).
+# A ServiceMonitor anywhere else is silently ignored: no error, no event, it
+# just never shows up under Status > Targets.
+#
+# `serviceMonitorSelectorNilUsesHelmValues: false` turns the selector into
+# `nil`, which to the Prometheus Operator means "match ALL ServiceMonitors in
+# every namespace I'm allowed to watch" instead of "match only ones with my
+# release label". This is the classic gotcha everyone hits once: you write a
+# perfectly good ServiceMonitor, scrape nothing, and spend an hour staring at
+# `kubectl get servicemonitor -A` wondering why it looks fine.
+#
+# This repo belt-and-braces it: the setting below makes selection permissive,
+# AND app/k8s/servicemonitor.yaml still carries the `release:
+# kube-prometheus-stack` label anyway, so this file also works unmodified
+# against a stock installation where someone flips this back to true.
+#
+# Same logic applies to podMonitorSelectorNilUsesHelmValues,
+# ruleSelectorNilUsesHelmValues (for PrometheusRule adoption — without this,
+# stack/prometheus/rules/*.yaml would be silently ignored too), and
+# probeSelectorNilUsesHelmValues.
+# =============================================================================
+
+prometheus:
+  prometheusSpec:
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+
+    # Explicitly watch every namespace rather than relying on a default. Keeps
+    # the "why isn't my target showing up" checklist short: selector (above),
+    # namespace (here), labels (on the object itself).
+    serviceMonitorNamespaceSelector: {}
+    podMonitorNamespaceSelector: {}
+    ruleNamespaceSelector: {}
+
+    # --- Retention -----------------------------------------------------------
+    # 7 days. Long enough that the 1d/3d burn-rate windows in
+    # stack/prometheus/rules/slo-alerts.yaml have real data after a few days of
+    # uptime, short enough to fit on a laptop disk. A production cluster
+    # fronted by Thanos/Mimir for long-term storage would set this much lower
+    # (a few hours) because durability is the remote store's job, not the
+    # local TSDB's — see README.md "What I'd do next in production".
+    retention: 7d
+    # Hard ceiling as a second guard rail independent of time-based retention,
+    # so a traffic spike (more series, more samples) cannot fill the node's
+    # disk outright.
+    retentionSize: 4GB
+
+    # --- Storage ---------------------------------------------------------
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          # minikube's default StorageClass ("standard") provisions
+          # hostPath-backed volumes — fine for a demo, gone the moment the
+          # minikube VM/container is deleted. A real cluster would pin a
+          # specific storageClassName backed by real block storage.
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 8Gi
+
+    # --- Resources ---------------------------------------------------------
+    # Requests are what the scheduler reasons about; keep them real. Limits
+    # are generous headroom for a scrape storm during `scripts/trigger-incident`
+    # (more active series, more alert evaluations) without OOMKilling
+    # Prometheus itself mid-demo — that would be an embarrassing thing to
+    # explain on a call.
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+
+    # --- Scrape / evaluation cadence -----------------------------------------
+    # Matches the ServiceMonitor's `interval: 15s` (app/k8s/servicemonitor.yaml).
+    # Keeping the GLOBAL default equal to every ServiceMonitor's own interval
+    # means you never have to remember which object overrode what.
+    scrapeInterval: 15s
+    evaluationInterval: 30s
+    scrapeTimeout: 10s
+
+    # Required for stack/tempo/values.yaml's metrics-generator: Tempo derives
+    # RED metrics and a service graph straight from trace span data and
+    # REMOTE-WRITES them into Prometheus rather than exposing them on a
+    # /metrics endpoint for Prometheus to scrape. Without this flag, Tempo's
+    # writes are rejected with a 404 and the service-graph/span-metrics
+    # panels on the Grafana dashboards stay empty with no obvious error
+    # anywhere — see docs/troubleshooting.md "Tempo not receiving spans".
+    enableRemoteWriteReceiver: true
+
+    # --- External labels -----------------------------------------------------
+    # Stamped onto every sample this Prometheus produces and onto every alert
+    # it sends to Alertmanager. Without `cluster` here, a multi-cluster setup
+    # (or a Thanos querier federating two Prometheis) cannot tell which
+    # cluster an alert or a series came from — a surprisingly common and
+    # entirely avoidable on-call confusion.
+    externalLabels:
+      cluster: minikube-demo
+      region: local
+
+    # --- Alertmanager config via code, not the UI ---------------------------
+    # Tells this Prometheus which Alertmanager to deliver alerts to. The
+    # routing/grouping/inhibition logic itself lives in
+    # stack/alertmanager/alertmanager-config.yaml, loaded via
+    # alertmanager.config below — NOT here.
+    alertingEndpoints: []  # left empty: the chart wires Prometheus -> its own
+                           # Alertmanager automatically when both are enabled
+                           # (the defaults below), which is the common case and
+                           # needs no extra endpoint entry.
+
+    # Pull in every PrometheusRule this repo ships, plus any future ones,
+    # regardless of label — consistent with ruleSelectorNilUsesHelmValues
+    # above.
+    additionalRuleLabels: {}
+
+  # Disabled on purpose: ingress is out of scope for a localhost demo reached
+  # via `kubectl port-forward` (scripts/port-forward.ps1/.sh).
+  ingress:
+    enabled: false
+
+# =============================================================================
+# Components that commonly FAIL on minikube, and why
+# =============================================================================
+# kube-prometheus-stack ships ServiceMonitors for kube-etcd,
+# kube-controller-manager and kube-scheduler out of the box. On a stock
+# minikube (and on most managed Kubernetes offerings) these targets show up
+# permanently red under Status > Targets, for entirely benign reasons:
+#
+#   - etcd:               minikube's etcd does not expose a metrics port on
+#                          the host-reachable address the ServiceMonitor
+#                          expects, and its client-cert auth is not wired up
+#                          by default.
+#   - kube-controller-manager / kube-scheduler: on recent Kubernetes these
+#                          bind to 127.0.0.1 inside the static pod by default
+#                          (CVE-hardening), which makes them unreachable from
+#                          a ServiceMonitor scraping the Service/Endpoints —
+#                          this is NOT a minikube bug, it is upstream default
+#                          hardening that also affects kubeadm clusters unless
+#                          you explicitly rebind them.
+#
+# The honest fix for a demo/portfolio cluster is to turn the scrape attempts
+# off rather than let a wall of permanently-red, explainable-in-one-sentence
+# targets dilute the Targets page. In a REAL cluster you would instead fix the
+# bind addresses (kubeadm: edit the static pod manifests under
+# /etc/kubernetes/manifests to bind --bind-address=0.0.0.0, carefully, as a
+# cluster-admin change) and leave these enabled — they are genuinely useful
+# signals (e.g. etcd leader changes, scheduler latency) on a cluster you
+# control.
+kubeEtcd:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+# kubeProxy scraping also frequently 404s on minikube's bundled kube-proxy
+# image build; disabled for the same "don't ship a known-red target" reason.
+kubeProxy:
+  enabled: false
+
+# kubelet and kube-state-metrics DO work fine on minikube out of the box and
+# are the source of every `kube_pod_*` / `kube_node_*` / `container_*` series
+# the infra alerts and the kubernetes-cluster.json dashboard depend on — keep
+# these enabled (they are enabled by default; listed here for clarity only).
+kubelet:
+  enabled: true
+kubeStateMetrics:
+  enabled: true
+nodeExporter:
+  enabled: true
+
+# =============================================================================
+# Grafana
+# =============================================================================
+grafana:
+  enabled: true
+
+  # --- Admin password via an EXISTING secret, never plaintext in values ----
+  # Create it once, out of band (kubectl, not committed to git):
+  #
+  #   kubectl -n monitoring create secret generic grafana-admin-credentials \
+  #     --from-literal=admin-user=admin \
+  #     --from-literal=admin-password='<pick-one>'
+  #
+  # scripts/install-stack.ps1/.sh create this secret for you with a generated
+  # password and print it once at the end of the run — it is never written to
+  # this file or to git.
+  admin:
+    existingSecret: grafana-admin-credentials
+    userKey: admin-user
+    passwordKey: admin-password
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 300m
+      memory: 256Mi
+
+  persistence:
+    enabled: true
+    size: 1Gi
+
+  # --- Sidecar dashboard discovery -----------------------------------------
+  # The grafana pod runs a small sidecar container that watches ConfigMaps
+  # carrying the label below, and drops their contents straight into
+  # Grafana's dashboard provisioning directory. This is "dashboards as code":
+  # the JSON files under stack/grafana/dashboards/json/ are the source of
+  # truth, wrapped in a ConfigMap by scripts/install-stack, and Grafana picks
+  # up ANY change to that ConfigMap within `folderAnnotation`/`searchNamespace`
+  # scope with zero restarts and zero clicking through the UI.
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: ALL
+      # Dashboards land in the folder named by this annotation on the
+      # ConfigMap, or "General" if absent. Keeping it explicit means a fresh
+      # install's folder layout matches what screenshots in this repo show.
+      folderAnnotation: grafana_folder
+      provider:
+        name: sidecar-dashboards
+        folder: ""
+        foldersFromFilesStructure: true
+    datasources:
+      enabled: true
+      label: grafana_datasource
+      labelValue: "1"
+      searchNamespace: ALL
+
+  # Provisioned datasources ALSO ship as plain YAML
+  # (stack/grafana/datasources/datasources.yaml) for the case where you are
+  # reading this repo rather than running `kubectl apply` — the sidecar and
+  # the static file describe the exact same three datasources, so pick
+  # whichever deployment path you prefer; scripts/install-stack uses the
+  # sidecar path (wraps the YAML in a labelled ConfigMap).
+
+  grafana.ini:
+    server:
+      # Matches scripts/port-forward.*, which forwards local :3000 ->
+      # grafana:3000 ($0 the default anyway; stated for clarity).
+      http_port: 3000
+    users:
+      default_theme: dark
+    # Anonymous viewing is OFF — this is a demo you drive, not a public
+    # dashboard. A production Grafana would sit behind SSO (OAuth/OIDC), not
+    # local accounts at all.
+    auth.anonymous:
+      enabled: false
+
+# =============================================================================
+# Alertmanager
+# =============================================================================
+alertmanager:
+  enabled: true
+  alertmanagerSpec:
+    resources:
+      requests:
+        cpu: 25m
+        memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+    storage:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 1Gi
+    # Keep the Helm-generated default config instead of inlining the routing
+    # tree here — config below, loaded from the dedicated file so it can be
+    # reviewed, diffed and unit-tested on its own. In Helm terms this maps to
+    # `alertmanager.config`, kept in its own file for readability; apply it
+    # with:
+    #   helm upgrade ... -f stack/prometheus/values.yaml \
+    #     --set-file alertmanager.config=stack/alertmanager/alertmanager-config.yaml
+    # or inline it directly — see stack/alertmanager/alertmanager-config.yaml
+    # for the full annotated routing tree, grouping and inhibition rules.
+
+  # Disabled: same reasoning as prometheus.ingress above.
+  ingress:
+    enabled: false
+
+# =============================================================================
+# Components intentionally left at chart defaults
+# =============================================================================
+# prometheusOperator: the Operator itself. Defaults are fine for a single
+# local cluster (no need for its own HA/leader-election tuning here).
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+# defaultRules: the chart's own bundled alerting rules (Watchdog,
+# KubePodCrashLooping generic version, etcd, etc). Kept enabled — they are a
+# reasonable baseline and this repo's alerts (stack/prometheus/rules/*.yaml)
+# are deliberately written to be ADDITIVE, not a replacement for them. The one
+# default rule called out specifically elsewhere in this repo is Watchdog —
+# see stack/alertmanager/alertmanager-config.yaml's `null` receiver and
+# docs/alerting-philosophy.md's "dead man's switch" section.
+defaultRules:
+  create: true
+  rules:
+    # Turned off because they target exactly the components disabled above —
+    # leaving them on would just recreate the "permanently red, explainable"
+    # noise this file just removed.
+    etcd: false
+    kubeControllerManager: false
+    kubeScheduler: false
+    kubeProxy: false

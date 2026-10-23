@@ -1,0 +1,145 @@
+# datasources.yaml — provisioned Grafana datasources: Prometheus, Loki, Tempo.
+#
+# THIS FILE IS WHY THE THREE PILLARS FEEL LIKE ONE SYSTEM.
+#
+# Any one of Prometheus/Loki/Tempo on its own answers "what" or "where" or
+# "why", but never all three. The payoff of running all three together is the
+# ability to JUMP between them while debugging: see a slow request in a
+# metric -> jump to the exact trace -> jump to the logs from that exact
+# request -> jump back to the service graph. None of that is automatic; it is
+# entirely configured here, in the `derivedFields`, `tracesToLogsV2`,
+# `tracesToMetrics` and `serviceMap` blocks below. Delete this file and you
+# still have three working datasources — you just lose every link between
+# them.
+#
+# Deployed either by applying this file directly as a provisioning ConfigMap,
+# or (as scripts/install-stack does) by wrapping it in a ConfigMap labelled
+# `grafana_datasource: "1"` so the sidecar described in
+# stack/prometheus/values.yaml's `grafana.sidecar.datasources` block picks it
+# up automatically with no restart.
+apiVersion: 1
+
+datasources:
+  # ===========================================================================
+  # PROMETHEUS
+  # ===========================================================================
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus # referenced by every dashboard JSON's {"type":"prometheus","uid":"prometheus"} datasource refs
+    access: proxy
+    # In-cluster Service DNS for the kube-prometheus-stack chart's Prometheus
+    # Service. If you installed under a different Helm release name, this
+    # host changes — `kubectl get svc -n monitoring | grep prometheus`.
+    url: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 15s # matches the global scrape_interval
+      httpMethod: POST # POST avoids URL-length limits on large PromQL queries
+      # Exemplars: Prometheus can store a trace_id as an exemplar alongside a
+      # histogram sample (the orders-api app would need
+      # EnableExemplarMetrics wired into its /metrics handler to populate
+      # this — noted as a "what I'd do next" in README.md). Pre-wiring the
+      # link here means exemplar support is a one-line app change away from
+      # working, not a dashboard rebuild.
+      exemplarTraceIdDestinations:
+        - datasourceUid: tempo
+          name: trace_id
+
+  # ===========================================================================
+  # LOKI
+  # ===========================================================================
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki.monitoring.svc.cluster.local:3100
+    jsonData:
+      # --- derivedFields: THE Loki -> Tempo correlation mechanism -----------
+      # For every log line Loki returns, Grafana runs this regex against the
+      # RAW LINE TEXT. app/main.go's traceHandler (see its big comment block)
+      # injects a top-level `"trace_id":"<32 hex chars>"` field into every log
+      # line that was written inside a recording span — so the pattern below
+      # matches it straight out of the JSON body, no Loki-side parsing
+      # required for the link itself (Promtail's `json` pipeline stage in
+      # stack/loki/promtail-values.yaml extracts the same field for LogQL
+      # filtering, which is a SEPARATE, complementary use of the same data).
+      #
+      # `matcherRegex` captures group 1; `url` is a Tempo trace-lookup URL
+      # template with `${__value.raw}` substituted from that capture. The
+      # result: every log line carrying a trace_id renders it as a clickable
+      # link that opens the exact matching trace in the Tempo datasource.
+      derivedFields:
+        - datasourceUid: tempo
+          matcherRegex: '"trace_id":"(\w+)"'
+          name: TraceID
+          url: "$${__value.raw}"
+          urlDisplayLabel: "View Trace"
+      maxLines: 1000
+    secureJsonData: {}
+
+  # ===========================================================================
+  # TEMPO
+  # ===========================================================================
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo.monitoring.svc.cluster.local:3100
+    jsonData:
+      # --- tracesToLogsV2: the REVERSE of Loki's derivedFields --------------
+      # From an open trace span, "Logs for this span" queries Loki for lines
+      # matching the span's own trace_id. `filterByTraceID`/`filterBySpanID`
+      # append `|= "<id>"` style filters automatically; `tags` maps span
+      # attributes (left) to Loki labels (right) to additionally narrow the
+      # search to the right stream — here, the span's `service.name` resource
+      # attribute maps onto Loki's `service` label (promoted by Promtail's
+      # labels stage), so the log search is scoped to the right service
+      # rather than grepping every stream in the cluster.
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: "-5m"
+        spanEndTimeShift: "5m"
+        filterByTraceID: true
+        filterBySpanID: false
+        tags:
+          - key: service.name
+            value: service
+
+      # --- tracesToMetrics: jump from a span to its Prometheus RED metrics --
+      # Lets you right-click a span and ask "show me this service's request
+      # rate/error rate around this time" using the span-metrics that Tempo's
+      # metrics-generator (stack/tempo/values.yaml) writes into Prometheus —
+      # the http.route dimension here is the exact one configured in that
+      # processor's `dimensions` list.
+      tracesToMetrics:
+        datasourceUid: prometheus
+        tags:
+          - key: service.name
+            value: service
+          - key: http.route
+            value: route
+        queries:
+          - name: "Request rate for this route"
+            query: 'sum(rate(traces_spanmetrics_calls_total{$__tags}[5m]))'
+          - name: "P99 latency for this route"
+            query: 'histogram_quantile(0.99, sum(rate(traces_spanmetrics_latency_bucket{$__tags}[5m])) by (le))'
+
+      # --- serviceMap: powers the node graph panel ----------------------------
+      # Reads the service-graph edges Tempo's metrics-generator wrote into
+      # Prometheus (traces_service_graph_request_total and friends) to draw
+      # who-calls-whom with live request/error/latency numbers on each edge —
+      # entirely derived from span data, zero manual topology maintenance.
+      serviceMap:
+        datasourceUid: prometheus
+
+      # Node graph view: shows the service graph inline on a trace view, not
+      # only as its own panel.
+      nodeGraph:
+        enabled: true
+
+      # Span bar labelling: durations shown directly on the waterfall rather
+      # than requiring a hover, which is the difference between "readable in
+      # a screenshot" and "readable only interactively" — relevant for every
+      # screenshot this repo's README/LinkedIn post wants to show.
+      spanBar:
+        type: Duration

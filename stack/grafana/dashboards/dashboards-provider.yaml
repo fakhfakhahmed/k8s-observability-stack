@@ -1,0 +1,32 @@
+# dashboards-provider.yaml — Grafana dashboard provisioning config.
+#
+# Tells Grafana's provisioning engine "watch this path on disk and load every
+# .json file in it as a dashboard, keep re-scanning for changes". Paired with
+# the sidecar described in stack/prometheus/values.yaml's
+# `grafana.sidecar.dashboards` block: the sidecar's job is to WATCH labelled
+# ConfigMaps and materialise their contents as files under the path below;
+# THIS file's job is to tell Grafana's own dashboard provisioner to pick up
+# whatever lands there. Two halves of one "dashboards as code" pipeline — see
+# stack/grafana/dashboards/json/README.md for the full authoring workflow.
+apiVersion: 1
+
+providers:
+  - name: sidecar-dashboards
+    orgId: 1
+    # Mirrors the ConfigMap's folder annotation (grafana_folder) when set, so
+    # a dashboard JSON that declares itself under e.g. "Observability" in its
+    # own ConfigMap annotation lands in a folder of that name rather than
+    # everything dumping into one flat list.
+    folder: ""
+    folderUid: ""
+    type: file
+    disableDeletion: false # removing the ConfigMap removes the dashboard — intentional
+    updateIntervalSeconds: 30 # how often Grafana re-scans the directory for changes
+    allowUiUpdates: true # edits made in the Grafana UI persist to Grafana's DB...
+    options:
+      path: /tmp/dashboards
+      foldersFromFilesStructure: true
+    # ...but allowUiUpdates does NOT write back to the JSON files in this
+    # repo. See dashboards/json/README.md "exporting changes back from the
+    # UI" for why this is deliberate and how to reconcile a UI edit back into
+    # version control.

@@ -1,0 +1,120 @@
+# values.yaml — Helm values for the `grafana/loki` chart, single-binary mode.
+#
+#   helm repo add grafana https://grafana.github.io/helm-charts
+#   helm upgrade --install loki grafana/loki -n monitoring -f stack/loki/values.yaml
+#
+# SINGLE BINARY, NOT MICROSERVICES MODE
+# --------------------------------------
+# Loki can run as one process (`deploymentMode: SingleBinary`) or as a dozen
+# independently-scaled microservices (distributor, ingester, querier,
+# compactor, ...). Microservices mode is what you run in production at
+# volume; single-binary mode runs everything — ingestion, storage, query — in
+# one pod. On a 4-CPU/8GB laptop also running Prometheus, Tempo and Grafana,
+# single-binary is not a compromise, it is the correct choice: there is no
+# ingestion volume here that needs independent scaling, and running twelve
+# tiny pods instead of one would spend more of the node's memory on process
+# overhead than on actually storing logs.
+deploymentMode: SingleBinary
+
+loki:
+  # Filesystem storage — object storage (S3/GCS/MinIO) is what a real
+  # deployment uses so ingesters are stateless and disposable; here there is
+  # exactly one replica and no multi-tenant durability requirement, so a
+  # hostPath-backed PVC is the honest, simplest choice.
+  storage:
+    type: filesystem
+
+  # Single-tenant mode. Loki is natively multi-tenant (every write/read carries
+  # an `X-Scope-OrgID` header); auth_enabled: false collapses everything to
+  # the implicit tenant "fake", which is exactly right for a demo with one
+  # namespace of interest and no need to isolate tenants from each other.
+  auth_enabled: false
+
+  commonConfig:
+    replication_factor: 1 # meaningless with one binary; explicit for clarity
+
+  # --- Retention -------------------------------------------------------------
+  # 7 days, matched to Prometheus's retention in stack/prometheus/values.yaml
+  # so that "how far back can I correlate a metric spike with its logs" has
+  # one consistent answer across the whole stack instead of two different
+  # cliffs.
+  limits_config:
+    retention_period: 168h # 7 days
+
+    # --- Cardinality / cost guard rails -------------------------------------
+    # These exist for the exact same reason the Prometheus cardinality
+    # comments in app/main.go exist: Loki's cost scales with the number of
+    # distinct LABEL combinations (streams), not with log volume. A bug that
+    # mints a new label value per request (e.g. labelling by request_id)
+    # creates a new stream per request and can take an undersized Loki down
+    # just as surely as an unbounded Prometheus label can.
+    max_streams_per_user: 10000
+    max_line_size: 256KB
+    ingestion_rate_mb: 8
+    ingestion_burst_size_mb: 16
+    # Reject logs whose own timestamp is more than 1h out of order. Promtail
+    # stamps with its own clock by default, so this mostly guards against a
+    # genuinely broken client clock rather than normal jitter.
+    reject_old_samples: true
+    reject_old_samples_max_age: 168h
+
+  compactor:
+    retention_enabled: true
+    delete_request_store: filesystem
+
+  # schemaConfig: Loki v13 index schema (tsdb) is the current recommended
+  # format — boltdb-shipper is the deprecated predecessor. tsdb is what lets
+  # Loki index chunks efficiently without external label cardinality limits
+  # biting as hard.
+  schemaConfig:
+    configs:
+      - from: "2024-01-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index:
+          prefix: loki_index_
+          period: 24h
+
+# --- Resources ---------------------------------------------------------------
+# Modest — this demo produces a trickle of structured JSON logs from a
+# handful of pods, nowhere near what would justify more.
+singleBinary:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  persistence:
+    enabled: true
+    size: 5Gi
+
+# Disable the components that only matter in microservices/distributed mode —
+# single-binary mode folds their jobs into the one pod above.
+read:
+  replicas: 0
+write:
+  replicas: 0
+backend:
+  replicas: 0
+
+# gateway: an nginx reverse proxy the chart can put in front of Loki. Not
+# needed for a single-binary, single-tenant, in-cluster-only deployment —
+# Grafana's datasource talks to the Loki Service directly (see
+# stack/grafana/datasources/datasources.yaml).
+gateway:
+  enabled: false
+
+# Monitoring of Loki itself (self-scrape via a ServiceMonitor the chart can
+# generate). Left on: it is a two-line win that feeds the same
+# kubernetes-cluster.json dashboard's "is the observability stack itself
+# healthy" story, and TargetDown's reasoning applies to Loki exactly as much
+# as it applies to orders-api.
+monitoring:
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: kube-prometheus-stack

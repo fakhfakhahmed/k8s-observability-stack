@@ -1,0 +1,221 @@
+# alerts-infra.yaml — cluster/node/workload-level alerts.
+#
+# These watch the PLATFORM underneath orders-api (and would watch any other
+# workload in the cluster): nodes, containers, PVCs, HPAs, certificates. They
+# are CAUSE-adjacent rather than pure symptom alerts — see
+# docs/alerting-philosophy.md for the distinction — but each one is scoped so
+# it only fires for conditions that would plausibly explain a user-visible
+# problem, not for "CPU is at 60%" style noise. Metrics are the free ones that
+# kube-state-metrics and node-exporter already export (both enabled in
+# stack/prometheus/values.yaml).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cluster-infra-alerts
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: orders-api
+    app.kubernetes.io/part-of: k8s-observability-stack
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: infra.node
+      rules:
+        # -----------------------------------------------------------------
+        # NodeMemoryPressure — available memory below 10% of total. Uses the
+        # node_exporter `node_memory_MemAvailable_bytes` gauge, which already
+        # accounts for reclaimable cache (unlike MemFree, which looks
+        # alarming on a perfectly healthy Linux box that is just using spare
+        # RAM for page cache).
+        # -----------------------------------------------------------------
+        - alert: NodeMemoryPressure
+          expr: |
+            (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) < 0.10
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Node {{ $labels.instance }} is under memory pressure"
+            description: >-
+              Only {{ $value | humanizePercentage }} of memory is available on
+              {{ $labels.instance }} (threshold 10%). The kubelet will start
+              evicting pods well before this reaches zero — check for a
+              runaway process or a chaos leak (/chaos/leak) left armed.
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/NodeMemoryPressure.md"
+            dashboard_url: "http://localhost:3000/d/obs-k8s-cluster"
+
+        # -----------------------------------------------------------------
+        # NodeDiskSpaceLow — predict_linear forecasts whether the filesystem
+        # will be exhausted within 4 hours based on the last hour's trend,
+        # which pages BEFORE the disk actually fills rather than after —
+        # the entire point of predict_linear over a static "<10% free" check.
+        # See docs/promql-cookbook.md's predict_linear entry.
+        # -----------------------------------------------------------------
+        - alert: NodeDiskSpaceLow
+          expr: |
+            predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}[1h], 4 * 3600) < 0
+            and
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"} < 0.20
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Disk on {{ $labels.instance }} ({{ $labels.mountpoint }}) projected to fill within 4h"
+            description: >-
+              At the current fill rate, {{ $labels.mountpoint }} on
+              {{ $labels.instance }} ({{ $value | humanize }} bytes remaining)
+              will run out of space in under 4 hours. Prometheus's own
+              retentionSize guard (stack/prometheus/values.yaml) protects
+              Prometheus itself, but other workloads on the same node are not
+              protected by it.
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/README.md"
+            dashboard_url: "http://localhost:3000/d/obs-k8s-cluster"
+
+    - name: infra.workloads
+      rules:
+        # -----------------------------------------------------------------
+        # KubePodNotReady — cluster-wide version of the orders-api-specific
+        # PodNotReady in alerts-app.yaml. Scoped to Pending/Unknown phase
+        # pods older than 15 minutes, which filters out the completely
+        # ordinary 10-30 seconds every pod spends Pending during a normal
+        # scheduling/rollout.
+        # -----------------------------------------------------------------
+        - alert: KubePodNotReady
+          expr: |
+            (
+              kube_pod_status_phase{phase=~"Pending|Unknown"} == 1
+            )
+            and on (namespace, pod) (
+              (time() - kube_pod_created) > 900
+            )
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Pod {{ $labels.pod }} in {{ $labels.namespace }} stuck Pending/Unknown"
+            description: >-
+              Pod {{ $labels.pod }} has been in phase Pending or Unknown for
+              more than 15 minutes. Common causes on a single-node minikube:
+              insufficient CPU/memory requests left on the node, an
+              unsatisfiable topologySpreadConstraint, or an image that cannot
+              be pulled (check imagePullPolicy against a locally-built image).
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/PodCrashLooping.md"
+            dashboard_url: "http://localhost:3000/d/obs-k8s-cluster"
+
+        # -----------------------------------------------------------------
+        # ContainerOOMKilled — fires once per OOM event, immediately, via the
+        # `for: 0m` pattern: this is a point-in-time event (the previous
+        # container terminated with reason OOMKilled), not a trend, so there
+        # is nothing to wait out. last_terminated_reason is a label, and the
+        # series value is always 1 when it exists — `== 1` is mostly
+        # documentation here, kept for clarity over relying on truthiness.
+        # -----------------------------------------------------------------
+        - alert: ContainerOOMKilled
+          expr: |
+            kube_pod_container_status_last_terminated_reason{namespace="demo", reason="OOMKilled"} == 1
+          for: 0m
+          labels:
+            severity: critical
+            team: orders
+            page: "true"
+          annotations:
+            summary: "Container {{ $labels.container }} in {{ $labels.pod }} was OOMKilled"
+            description: >-
+              {{ $labels.container }} in pod {{ $labels.pod }} was killed by
+              the kernel OOM killer. Compare the container's memory limit
+              against its GOMEMLIMIT setting (app/k8s/deployment.yaml sets
+              GOMEMLIMIT to ~85% of the limit specifically to make the Go GC
+              work harder before this happens) and check for /chaos/leak left
+              armed if this is the demo app.
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/ContainerOOMKilled.md"
+            dashboard_url: "http://localhost:3000/d/obs-k8s-cluster"
+
+        # -----------------------------------------------------------------
+        # HPAMaxedOut — the HPA has been pinned at maxReplicas while still
+        # wanting more. This repo's orders-api does not ship an HPA (fixed at
+        # 2 replicas, see app/k8s/deployment.yaml) — this alert is included
+        # as a general-purpose cluster rule from kube-state-metrics'
+        # kube_horizontalpodautoscaler_* series, ready for the day an HPA is
+        # added here or to any other workload in the cluster. It will simply
+        # never fire until one exists, which is the correct behaviour for an
+        # absent target rather than a misconfigured one.
+        # -----------------------------------------------------------------
+        - alert: HPAMaxedOut
+          expr: |
+            kube_horizontalpodautoscaler_status_current_replicas
+              == kube_horizontalpodautoscaler_spec_max_replicas
+            and
+            kube_horizontalpodautoscaler_status_desired_replicas
+              >= kube_horizontalpodautoscaler_spec_max_replicas
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "HPA {{ $labels.horizontalpodautoscaler }} pinned at max replicas"
+            description: >-
+              {{ $labels.horizontalpodautoscaler }} in namespace
+              {{ $labels.namespace }} has been at its maxReplicas ceiling for
+              15 minutes while still wanting to scale further. The workload is
+              capacity constrained, not just momentarily busy: raise
+              maxReplicas, reduce per-pod resource requests, or investigate
+              why the scale target metric is not coming back down.
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/README.md"
+            dashboard_url: "http://localhost:3000/d/obs-k8s-cluster"
+
+        # -----------------------------------------------------------------
+        # PVCNearlyFull — covers Prometheus's, Loki's, Grafana's and
+        # Alertmanager's own PersistentVolumeClaims. kubelet_volume_stats
+        # comes from the kubelet's own cAdvisor-adjacent collector, enabled by
+        # the `kubelet.enabled: true` in stack/prometheus/values.yaml.
+        # -----------------------------------------------------------------
+        - alert: PVCNearlyFull
+          expr: |
+            kubelet_volume_stats_available_bytes / kubelet_volume_stats_capacity_bytes < 0.10
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "PVC {{ $labels.persistentvolumeclaim }} is nearly full"
+            description: >-
+              PersistentVolumeClaim {{ $labels.persistentvolumeclaim }} in
+              {{ $labels.namespace }} has only
+              {{ $value | humanizePercentage }} free space. If this is
+              Prometheus's own volume, retentionSize in
+              stack/prometheus/values.yaml should already prevent this —
+              treat it as a sign the retentionSize/storage ratio needs
+              revisiting, not just a one-off cleanup.
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/PVCNearlyFull.md"
+            dashboard_url: "http://localhost:3000/d/obs-k8s-cluster"
+
+        # -----------------------------------------------------------------
+        # CertificateExpiringSoon — generic rule against the standard
+        # `x509_cert_expiry` style gauge some ingress controllers / cert
+        # exporters publish as seconds-until-expiry. Nothing in this demo
+        # stack terminates TLS today (Grafana/Prometheus are reached over
+        # plain HTTP via kubectl port-forward — see docs/architecture.md), so
+        # like HPAMaxedOut this is a dormant, ready-to-fire rule documenting
+        # what you would wire up the moment an Ingress with TLS appears.
+        # -----------------------------------------------------------------
+        - alert: CertificateExpiringSoon
+          expr: |
+            x509_cert_expiry_seconds < (14 * 24 * 3600)
+          for: 1h
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "TLS certificate for {{ $labels.instance }} expires within 14 days"
+            description: >-
+              Certificate serial {{ $labels.serial_no }} on
+              {{ $labels.instance }} expires in
+              {{ $value | humanizeDuration }}. Renew it before it lapses — an
+              expired cert silently fails closed for every HTTPS client with
+              no traffic-level signal beforehand, which is exactly the kind of
+              invisible failure this alert exists to surface early.
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/README.md"
+            dashboard_url: "http://localhost:3000/d/obs-k8s-cluster"

@@ -1,0 +1,41 @@
+# Keep the build context small and deterministic.
+#
+# Everything excluded here is either irrelevant to the compile step or would
+# bust the Docker layer cache on every edit. A lean context also means secrets
+# that happen to be lying around in the repo never reach the daemon.
+
+# Kubernetes manifests are applied by kubectl, not baked into the image.
+k8s/
+
+# Version control
+.git/
+.gitignore
+
+# Editor / IDE noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build output (the image builds its own binary)
+bin/
+dist/
+orders-api
+orders-api.exe
+*.test
+*.out
+
+# Documentation does not belong in a container image
+*.md
+LICENSE
+
+# Local environment and secrets — never ship these
+.env
+.env.*
+*.pem
+*.key
+
+# OS detritus
+.DS_Store
+Thumbs.db

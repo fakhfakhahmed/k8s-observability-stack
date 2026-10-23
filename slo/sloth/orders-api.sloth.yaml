@@ -1,0 +1,128 @@
+# orders-api.sloth.yaml — native Sloth spec for both orders-api SLOs.
+#
+# Sloth (https://sloth.dev) is a CLI/operator that takes a spec in exactly
+# this shape and GENERATES a complete PrometheusRule — every recording rule
+# window, every burn-rate alert rung, with the same multi-window
+# multi-burn-rate method this repo implements by hand in
+# stack/prometheus/rules/recording-rules.yaml and slo-alerts.yaml.
+#
+# WHY THIS REPO HAND-WRITES THE RULES INSTEAD OF RUNNING SLOTH
+# ---------------------------------------------------------------
+# This file is included to show the equivalent, tool-generated path and to
+# prove the hand-written rules are not inventing a different method — plug
+# this spec into Sloth and it produces rules structurally identical to
+# stack/prometheus/rules/slo-alerts.yaml (same windows, same 14.4/6/3/1
+# thresholds, same long/short pairing).
+#
+# The hand-written version is kept as the SOURCE OF TRUTH in this repo for
+# one reason: comments. Sloth's generated PrometheusRule has no inline
+# explanation of WHY 14.4 is the magic number, why the short window resets
+# faster than the long window, or why health checks are excluded from the
+# SLI — all of that lives in slo-alerts.yaml's header and docs/slo-guide.md
+# instead. For a PORTFOLIO repository whose entire point is demonstrating
+# SRE reasoning, a generator that hides the arithmetic behind a one-line
+# `threshold: 14.4` works against the goal. In a real team running many
+# services, the trade reverses: Sloth's consistency and "add an SLO in five
+# lines" ergonomics win decisively over N hand-maintained, independently
+# drifting rule files. Use Sloth there; this repo hand-writes because
+# explaining the maths IS the product.
+#
+# Generating the PrometheusRule from this file (if you want to compare it
+# against the hand-written one, or adopt Sloth for a real service):
+#
+#   sloth generate -i slo/sloth/orders-api.sloth.yaml -o /tmp/orders-api-sloth-rules.yaml
+#   diff /tmp/orders-api-sloth-rules.yaml stack/prometheus/rules/slo-alerts.yaml
+#
+# (Requires the `sloth` binary: https://github.com/slok/sloth/releases —
+# not installed or invoked by anything in this repo.)
+version: "prometheus/v1"
+service: "orders-api"
+labels:
+  team: orders
+  tier: "1"
+  part_of: k8s-observability-stack
+
+slos:
+  # ===========================================================================
+  # Availability — mirrors slo/availability.yaml and
+  # stack/prometheus/rules/slo-alerts.yaml's "slo.availability.rules" group.
+  # ===========================================================================
+  - name: "orders-api-availability"
+    objective: 99.9
+    description: >
+      99.9% of non-probe, non-chaos HTTP requests to orders-api return a
+      non-5xx status, rolling 30 days.
+    sli:
+      events:
+        errorQuery: |
+          sum(rate(http_requests_total{job="orders-api", status=~"5..",
+              route!~"/healthz|/readyz|/chaos"}[{{.window}}]))
+        totalQuery: |
+          sum(rate(http_requests_total{job="orders-api",
+              route!~"/healthz|/readyz|/chaos"}[{{.window}}]))
+    alerting:
+      name: ErrorBudgetBurn
+      labels:
+        slo: availability
+        service: orders-api
+      annotations:
+        runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/ErrorBudgetBurn.md"
+        dashboard_url: "http://localhost:3000/d/obs-slo-budget"
+      # Sloth's page/ticket alerts correspond 1:1 to this repo's four rungs:
+      # page.shortWindow/longWindow -> the 14.4x (1h/5m) and 6x (6h/30m)
+      # rungs; ticket.shortWindow/longWindow -> the 3x (1d/2h) and 1x (3d/6h)
+      # rungs. Sloth derives the exact 14.4/6/3/1 multipliers itself from the
+      # objective, using the identical policy-driven formula documented in
+      # stack/prometheus/rules/slo-alerts.yaml's header (2%/1h, 5%/6h,
+      # 10%/1d, 10%/3d of the budget).
+      page:
+        disable: false
+        labels:
+          severity: critical
+          page: "true"
+      ticket:
+        disable: false
+        labels:
+          severity: warning
+          page: "false"
+
+  # ===========================================================================
+  # Latency — mirrors slo/latency.yaml and slo-alerts.yaml's
+  # "slo.latency.rules" group.
+  # ===========================================================================
+  - name: "orders-api-latency"
+    objective: 99
+    description: >
+      99% of /api/orders and /api/checkout requests complete in under
+      300ms, rolling 30 days. 300ms is pinned to an exact bucket boundary
+      (le="0.3") in http_request_duration_seconds — see app/main.go's
+      histogram definition and docs/slo-guide.md section 5.
+    sli:
+      events:
+        errorQuery: |
+          sum(rate(http_request_duration_seconds_count{job="orders-api",
+              route=~"/api/orders|/api/checkout"}[{{.window}}]))
+          -
+          sum(rate(http_request_duration_seconds_bucket{job="orders-api",
+              route=~"/api/orders|/api/checkout", le="0.3"}[{{.window}}]))
+        totalQuery: |
+          sum(rate(http_request_duration_seconds_count{job="orders-api",
+              route=~"/api/orders|/api/checkout"}[{{.window}}]))
+    alerting:
+      name: ErrorBudgetBurn
+      labels:
+        slo: latency
+        service: orders-api
+      annotations:
+        runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/ErrorBudgetBurn.md"
+        dashboard_url: "http://localhost:3000/d/obs-slo-budget"
+      page:
+        disable: false
+        labels:
+          severity: critical
+          page: "true"
+      ticket:
+        disable: false
+        labels:
+          severity: warning
+          page: "false"

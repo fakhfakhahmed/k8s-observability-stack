@@ -1,0 +1,71 @@
+# Service for orders-api.
+#
+# The ServiceMonitor in servicemonitor.yaml selects THIS Service, and then
+# scrapes the Pods behind it. That indirection matters: the ServiceMonitor's
+# `endpoints[].port` refers to the *name* of a port on this Service, not on the
+# Pod and not a number. Getting that wrong is the second most common reason a
+# target never appears in Prometheus (the first is the selector gotcha — see
+# docs/troubleshooting.md).
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders-api
+  namespace: demo
+  labels:
+    # The ServiceMonitor matches on these labels.
+    app.kubernetes.io/name: orders-api
+    app.kubernetes.io/instance: orders-api
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: k8s-observability-stack
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  type: ClusterIP
+  selector:
+    # Must match the Pod template labels in deployment.yaml. A mismatch here
+    # gives you a Service with zero Endpoints — `kubectl get endpoints
+    # orders-api -n demo` showing <none> is the tell.
+    app.kubernetes.io/name: orders-api
+    app.kubernetes.io/instance: orders-api
+  ports:
+    # One port serves both the application and /metrics. Splitting them onto a
+    # dedicated metrics port is also valid and is what you would do if the app
+    # port were exposed through an Ingress; here a single port keeps the demo
+    # simple and the ServiceMonitor honest.
+    - name: http            # <- referenced by ServiceMonitor .endpoints[].port
+      port: 8080
+      targetPort: http      # named port on the container
+      protocol: TCP
+  # Do not drop long-lived connections the instant a pod goes away; combined
+  # with the app's drain-on-SIGTERM behaviour this gives genuinely graceful
+  # rollouts.
+  sessionAffinity: None
+---
+# A headless companion Service.
+#
+# Not required by Prometheus, but it gives every pod a stable DNS name
+# (orders-api-0.orders-api-headless.demo.svc.cluster.local style resolution via
+# the A records of the headless service). scripts/heal uses per-pod addressing
+# because chaos state is in-memory and per-process, so being able to resolve
+# individual pods rather than load-balancing across them is genuinely useful.
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders-api-headless
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: orders-api
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: k8s-observability-stack
+spec:
+  type: ClusterIP
+  clusterIP: None           # headless: DNS returns pod IPs, not a VIP
+  publishNotReadyAddresses: true  # resolve pods even while draining
+  selector:
+    app.kubernetes.io/name: orders-api
+    app.kubernetes.io/instance: orders-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

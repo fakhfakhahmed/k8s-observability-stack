@@ -1,0 +1,121 @@
+# availability.yaml — declarative SLO definition: orders-api availability.
+#
+# Shape is deliberately OpenSLO/Sloth-COMPATIBLE: the same fields
+# (service, sli.events.error_query/total_query, objectives.target, the
+# alerting.window_type: multi-window-burn-rate block) map directly onto a
+# Sloth spec — see slo/sloth/ for the actual Sloth-native version of this
+# same SLO and a note on generating PrometheusRules from it. This file is
+# the "specification" referred to in docs/slo-guide.md section 2: the
+# human-readable contract that stack/prometheus/rules/recording-rules.yaml
+# and slo-alerts.yaml hand-implement.
+#
+# This file is NOT consumed by any tool in this repo — the PrometheusRules
+# are hand-written for full control and inline-documented maths (see
+# stack/prometheus/rules/slo-alerts.yaml's extensive comments). It exists so
+# the SLO's definition lives in one declarative place that a reviewer or a
+# future Sloth/OpenSLO adoption can read without reverse-engineering it out
+# of PromQL.
+apiVersion: openslo/v1
+kind: SLO
+metadata:
+  name: orders-api-availability
+  displayName: "orders-api — Availability"
+spec:
+  service: orders-api
+  description: >
+    99.9% of HTTP requests to orders-api — excluding health/readiness probes
+    and chaos fault-injection endpoints — return a non-5xx status, measured
+    over a rolling 30-day window. See docs/slo-guide.md sections 1-3 for the
+    full rationale behind the status-class choices and the exclusion list.
+
+  # --- SLI: the ratio of good events to valid events ------------------------
+  indicator:
+    thresholdMetric:
+      metricSource:
+        type: prometheus
+        spec:
+          # "Bad" events — stored as the bad ratio throughout this repo so
+          # every alert expression reads `ratio > threshold` with no `1 -`.
+          # See docs/slo-guide.md section 5.
+          errorQuery: |
+            sum(rate(http_requests_total{job="orders-api", status=~"5..",
+                route!~"/healthz|/readyz|/chaos"}[{{.window}}]))
+          # All valid events — the denominator. Must apply the IDENTICAL
+          # label filters as errorQuery except for the "bad" condition
+          # itself, or the ratio is silently wrong (see the SLO review
+          # checklist in docs/slo-guide.md section 8).
+          totalQuery: |
+            sum(rate(http_requests_total{job="orders-api",
+                route!~"/healthz|/readyz|/chaos"}[{{.window}}]))
+
+  # --- Objective -------------------------------------------------------------
+  objectives:
+    - displayName: "99.9% non-5xx"
+      target: 0.999
+      op: gt # "good" means the ratio of GOOD events is greater than target
+
+  timeWindow:
+    - duration: 30d
+      isRolling: true # NOT a calendar month — see docs/slo-guide.md section 4
+                        # for why a rolling window is used throughout this repo
+
+  budgetingMethod: Occurrences # budget is counted in events (good/bad
+                                 # request counts), not in elapsed wall-clock
+                                 # time, which is the correct method whenever
+                                 # the SLI itself is already a ratio of events
+
+  # --- Alerting: multi-window multi-burn-rate ladder -------------------------
+  # Mirrors stack/prometheus/rules/slo-alerts.yaml exactly. See that file's
+  # extensive header comment for the full derivation of every number below —
+  # this block is the declarative summary, not a re-derivation.
+  alertPolicies:
+    - alertMethod: pagerduty-critical
+      conditions:
+        - kind: burnrate
+          op: gt
+          threshold: 14.4
+          lookbackWindow: 1h
+          longWindow: 1h
+          shortWindow: 5m
+          severity: critical
+          page: true
+        - kind: burnrate
+          op: gt
+          threshold: 6
+          lookbackWindow: 6h
+          longWindow: 6h
+          shortWindow: 30m
+          severity: critical
+          page: true
+    - alertMethod: slack-warning
+      conditions:
+        - kind: burnrate
+          op: gt
+          threshold: 3
+          lookbackWindow: 1d
+          longWindow: 1d
+          shortWindow: 2h
+          severity: warning
+          page: false
+        - kind: burnrate
+          op: gt
+          threshold: 1
+          lookbackWindow: 3d
+          longWindow: 3d
+          shortWindow: 6h
+          severity: warning
+          page: false
+
+  # --- Error budget, stated in concrete units --------------------------------
+  # (1 - 0.999) x 30 days x 24h x 60m = 43.2 minutes. See slo/README.md's
+  # full error budget maths table and policy for what happens at each
+  # remaining-budget threshold.
+  errorBudget:
+    totalMinutesPer30Days: 43.2
+    policy: see slo/README.md#the-error-budget-policy
+
+  labels:
+    team: orders
+    tier: "1"
+    runbook: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/ErrorBudgetBurn.md"
+    dashboard: "http://localhost:3000/d/obs-slo-budget"

@@ -1,0 +1,230 @@
+# alertmanager-config.yaml — routing tree, grouping, inhibition and receivers.
+#
+# Apply via the kube-prometheus-stack chart's `alertmanager.config` value:
+#
+#   helm upgrade kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+#     -n monitoring -f stack/prometheus/values.yaml \
+#     --set-file alertmanager.config=stack/alertmanager/alertmanager-config.yaml
+#
+# (scripts/install-stack.ps1/.sh do this for you.)
+#
+# This is where every `severity`/`team`/`page` label stamped on an alert in
+# stack/prometheus/rules/*.yaml actually gets turned into "who gets told,
+# how, and how often" — the PrometheusRule files decide WHAT fires; this file
+# decides WHO HEARS ABOUT IT.
+global:
+  resolve_timeout: 5m
+  # Placeholder — replace with a real Slack incoming webhook. Never commit a
+  # real one: scripts/install-stack reads it from an environment variable /
+  # out-of-band secret instead of this file.
+  slack_api_url: "https://hooks.slack.com/services/REPLACE/ME/WITH-A-REAL-WEBHOOK"
+
+# -----------------------------------------------------------------------------
+# templates: custom notification formatting. See templates/slack.tmpl for the
+# full message layout (summary, runbook link, dashboard link, all the labels
+# an on-call engineer needs without clicking through to Prometheus first).
+# -----------------------------------------------------------------------------
+templates:
+  - "/etc/alertmanager/config/slack.tmpl"
+
+# -----------------------------------------------------------------------------
+# time_intervals: named windows referenced by routes below via
+# `active_time_intervals` / `mute_time_intervals`. Business hours here is
+# Mon-Fri 09:00-18:00 Europe/Paris — change to match your team's actual
+# timezone and coverage; a muted-hours route is only honest if it matches
+# when a human is actually expected to look at a screen.
+# -----------------------------------------------------------------------------
+time_intervals:
+  - name: business-hours
+    time_intervals:
+      - weekdays: ["monday:friday"]
+        times:
+          - start_time: "09:00"
+            end_time: "18:00"
+        location: "Europe/Paris"
+  - name: out-of-hours
+    time_intervals:
+      - weekdays: ["saturday", "sunday"]
+      - weekdays: ["monday:friday"]
+        times:
+          - start_time: "00:00"
+            end_time: "09:00"
+          - start_time: "18:00"
+            end_time: "24:00"
+        location: "Europe/Paris"
+
+# -----------------------------------------------------------------------------
+# route: the routing tree. Evaluated top-down; a child route's `matchers`
+# decide whether it claims the alert (and, unless `continue: true`, STOPS
+# further matching) — a classic trap is forgetting `continue: true` on a
+# route you wanted to also fall through to a sibling.
+# -----------------------------------------------------------------------------
+route:
+  # Default grouping for anything not matched below.
+  #
+  #   group_by    — which labels define "the same incident". Grouping by
+  #                 alertname + service + slo means the four ErrorBudgetBurn
+  #                 rungs for orders-api's availability SLO are ONE
+  #                 notification thread, not four separate pages — see the
+  #                 "ONE ALERTNAME, MANY LABELS" section of slo-alerts.yaml.
+  #   group_wait  — after the FIRST alert in a new group fires, wait this
+  #                 long before sending the first notification, in case
+  #                 related alerts (e.g. a sibling rung, or PodCrashLooping
+  #                 AND HighErrorRate for the same root cause) arrive and can
+  #                 be bundled into the SAME message instead of three.
+  #   group_interval — once a group has already notified, how long to wait
+  #                 before sending an update that includes newly-fired
+  #                 alerts in that same group (not a full resend).
+  #   repeat_interval — how long a STILL-FIRING, unchanged group goes before
+  #                 Alertmanager reminds you it is still firing. Short for
+  #                 critical/paging alerts (nobody should forget an open
+  #                 incident for 4 hours); long for informational ones.
+  receiver: slack-default
+  group_by: ["alertname", "service", "slo"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+  routes:
+    # --- Watchdog: the dead man's switch -----------------------------------
+    # kube-prometheus-stack's defaultRules (stack/prometheus/values.yaml)
+    # bundles an always-firing `Watchdog` alert. Routed to a `null` receiver
+    # (sends nowhere) but CRITICALLY still evaluated and still flows through
+    # Alertmanager — monitoring tools (e.g. a separate uptime check against
+    # Alertmanager, or PagerDuty's own "did we hear from Prometheus recently"
+    # feature) watch for this alert's continued presence. If Watchdog ever
+    # STOPS firing, that means Prometheus, the rule evaluator, or the entire
+    # pipeline between them and Alertmanager died — the one failure mode
+    # where every other alert in this file would also be silent. See
+    # docs/alerting-philosophy.md "dead man's switch" for the full rationale.
+    - receiver: "null"
+      matchers:
+        - alertname = "Watchdog"
+
+    # --- Paging route: anything labelled page="true" -----------------------
+    # Both the critical-severity SLO burn rungs (14.4x, 6x) and a handful of
+    # app/infra alerts (PodCrashLooping, ContainerOOMKilled, NoTrafficReceived)
+    # carry `page: "true"`. Routing on that explicit label — rather than on
+    # `severity: critical` alone — keeps the paging decision a single
+    # intentional opt-in per alert rule instead of an accident of whichever
+    # severity value someone typed.
+    - receiver: pagerduty-critical
+      matchers:
+        - page = "true"
+      group_wait: 10s # pages should not sit in group_wait while a second
+                       # confirming alert is awaited — get the human moving
+      repeat_interval: 1h
+      continue: true # ALSO fall through to Slack below — redundancy on the
+                      # notification channel itself, not just on-call escalation
+
+    # --- Slack, split by severity -------------------------------------------
+    - receiver: slack-critical
+      matchers:
+        - severity = "critical"
+      group_wait: 10s
+      repeat_interval: 1h
+
+    - receiver: slack-warning
+      matchers:
+        - severity = "warning"
+      # Warnings during business hours go to the team channel at the default
+      # cadence; out of hours they are muted from repeating so nobody's phone
+      # buzzes for a ticket-severity issue at 2am — it is still VISIBLE in
+      # Slack and in the Alertmanager UI, just not re-announced.
+      mute_time_intervals:
+        - out-of-hours
+      repeat_interval: 12h
+
+# -----------------------------------------------------------------------------
+# inhibit_rules: suppress a LOWER-priority alert while a HIGHER-priority one
+# for the "same thing" is already firing. This is what stops an alert storm
+# from a single root cause turning into a wall of independent pings.
+# -----------------------------------------------------------------------------
+inhibit_rules:
+  # If a critical ErrorBudgetBurn rung (14.4x or 6x) is firing for a given
+  # service+slo, suppress the warning-severity rungs (3x, 1x) for that SAME
+  # service+slo. All four rungs share the alertname `ErrorBudgetBurn` (see
+  # slo-alerts.yaml) and the ladder is STRICTLY ordered — if you are burning
+  # at 14.4x you are, by construction, also burning faster than 3x and 1x, so
+  # the warning rungs firing alongside the critical one add zero new
+  # information and would just double the notification volume for one
+  # incident.
+  - source_matchers:
+      - severity = "critical"
+      - alertname = "ErrorBudgetBurn"
+    target_matchers:
+      - severity = "warning"
+      - alertname = "ErrorBudgetBurn"
+    equal: ["service", "slo"]
+
+  # If a pod is crash-looping, the HighErrorRate / HighLatencyP99 alerts for
+  # the SAME service are a symptom of the SAME root cause (a pod that keeps
+  # dying is not going to serve fast, correct responses either) — suppress
+  # them so the on-call engineer sees ONE actionable alert
+  # (PodCrashLooping, which has the more specific runbook) instead of three.
+  - source_matchers:
+      - alertname = "PodCrashLooping"
+    target_matchers:
+      - alertname =~ "HighErrorRate|HighLatencyP99"
+    equal: ["service"]
+
+  # A TargetDown for a service makes every SLO/RED alert for that service
+  # meaningless — there is no data to evaluate them against, and
+  # NoTrafficReceived already covers "we have gone quiet". Suppress
+  # everything else for a service Prometheus cannot even reach.
+  - source_matchers:
+      - alertname = "TargetDown"
+    target_matchers:
+      - alertname =~ "HighErrorRate|HighLatencyP99|ErrorBudgetBurn|QueueDepthGrowing"
+    equal: ["service"]
+
+# -----------------------------------------------------------------------------
+# receivers
+# -----------------------------------------------------------------------------
+receivers:
+  - name: "null" # Alertmanager's built-in "send nowhere" receiver
+
+  - name: slack-default
+    slack_configs:
+      - channel: "#alerts-orders-api"
+        send_resolved: true
+        title: '{{ template "slack.title" . }}'
+        text: '{{ template "slack.text" . }}'
+
+  - name: slack-critical
+    slack_configs:
+      - channel: "#alerts-critical"
+        send_resolved: true
+        title: '{{ template "slack.title" . }}'
+        text: '{{ template "slack.text" . }}'
+        color: "danger"
+
+  - name: slack-warning
+    slack_configs:
+      - channel: "#alerts-orders-api"
+        send_resolved: true
+        title: '{{ template "slack.title" . }}'
+        text: '{{ template "slack.text" . }}'
+        color: "warning"
+
+  - name: pagerduty-critical
+    # Placeholder service key — a real deployment reads this from a Secret
+    # (`existingSecret`/envsubst at apply time), never commits it in plain
+    # text. See README.md "what I'd do next in production" for wiring a real
+    # on-call rotation.
+    pagerduty_configs:
+      - service_key: "REPLACE_WITH_REAL_PAGERDUTY_INTEGRATION_KEY"
+        send_resolved: true
+        description: '{{ .CommonAnnotations.summary }}'
+        details:
+          runbook: '{{ .CommonAnnotations.runbook_url }}'
+          dashboard: '{{ .CommonAnnotations.dashboard_url }}'
+
+  - name: webhook-generic
+    # A generic catch-all for integrating with anything this file does not
+    # name explicitly (an internal incident tool, a status page updater, a
+    # second chat platform). Not referenced by any route above — kept as a
+    # ready-made example of the shape a custom receiver takes.
+    webhook_configs:
+      - url: "http://example-internal-webhook.monitoring.svc.cluster.local:8080/alerts"
+        send_resolved: true

@@ -1,0 +1,26 @@
+# Namespace for the demo workload.
+#
+# Kept separate from `monitoring` on purpose: it proves the ServiceMonitor
+# cross-namespace discovery path actually works. A stack that only ever scrapes
+# targets living in its own namespace has not been tested.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+  labels:
+    # Used by the ServiceMonitor's namespaceSelector and by Grafana dashboard
+    # template variables.
+    name: demo
+    app.kubernetes.io/part-of: k8s-observability-stack
+
+    # Pod Security Admission. `restricted` is the strictest built-in profile:
+    # it requires runAsNonRoot, a dropped capability set, a seccomp profile and
+    # no privilege escalation — all of which the Deployment already satisfies.
+    # Enforcing it here means a future careless edit is rejected by the API
+    # server rather than quietly running as root.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+  annotations:
+    description: "Demo application namespace for the k8s-observability-stack project."

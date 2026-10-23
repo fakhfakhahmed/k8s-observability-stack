@@ -1,0 +1,461 @@
+# recording-rules.yaml — precomputed RED + SLO series for orders-api.
+#
+# WHY RECORDING RULES EXIST AT ALL
+# ---------------------------------
+# Every expression below is cheap on its own, but the SLO burn-rate ladder in
+# slo-alerts.yaml needs EIGHT different windows of the SAME ratio (5m, 30m,
+# 1h, 2h, 6h, 1d, 3d, plus 30d for the dashboard). Inlined into eight alert
+# rules, each evaluation re-scans the raw `http_requests_total` counter over
+# its own window — the 3d window alone touches roughly 3 days x (60/15)
+# samples x number of series, every 30 seconds, forever. Recorded ONCE here,
+# every consumer (alerts, the slo-error-budget dashboard, ad-hoc queries in
+# the Grafana Explore tab) reads a single already-computed series instead.
+#
+# The second reason is CONSISTENCY: an alert and a dashboard panel that each
+# reimplement "the availability ratio" independently will disagree the moment
+# someone edits one exclusion list and not the other, and you will spend the
+# first ten minutes of a real incident arguing with a graph instead of fixing
+# the problem. Recording rules make the ratio a single named contract that
+# both read.
+#
+# NAMING CONVENTION: level:metric:operations
+# --------------------------------------------
+#   level      — the label set the rule aggregates DOWN TO (what survives
+#                the `sum by (...)`)
+#   metric     — the base metric or quantity the rule is built from
+#   operations — what was done to it, read left to right
+#
+# Examples in this file:
+#   route:http_requests:rate5m                — per route, from
+#                                                http_requests_total, rate
+#                                                summed over 5m
+#   job:http_request_duration_seconds:p99     — per job, from the duration
+#                                                histogram, histogram_quantile
+#                                                at 0.99
+#   job:slo_availability_errors:ratio_rate1h  — per job, availability "bad"
+#                                                event ratio, over a 1h rate
+#
+# Colons appear ONLY in recording rule names, never in a raw exported metric.
+# That makes a colon in any query an instant visual signal "this is
+# pre-aggregated", which matters when you are debugging whether a dashboard
+# number and a raw `curl .../metrics` number should even match.
+#
+# See docs/slo-guide.md section 6 for the full design rationale, and
+# docs/promql-cookbook.md for the individual query idioms used here.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: orders-api-recording-rules
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: orders-api
+    app.kubernetes.io/part-of: k8s-observability-stack
+    # Picked up by ruleSelectorNilUsesHelmValues: false in
+    # stack/prometheus/values.yaml — see that file's big comment block for why
+    # this label is still here even though the selector is permissive.
+    release: kube-prometheus-stack
+spec:
+  groups:
+    # -------------------------------------------------------------------
+    # RED: Rate — request throughput, aggregated per route. Feeds the "request
+    # rate by route" panel on app-red-metrics.json.
+    # -------------------------------------------------------------------
+    - name: orders-api.red.rate
+      interval: 30s
+      rules:
+        - record: route:http_requests:rate5m
+          expr: |
+            sum by (job, route, method) (
+              rate(http_requests_total{job="orders-api"}[5m])
+            )
+          labels:
+            service: orders-api
+
+    # -------------------------------------------------------------------
+    # RED: Errors — error ratio per route (NOT the SLO ratio: this one is
+    # NOT filtered for probes/chaos, because it exists for debugging "which
+    # route is unhealthy right now", not for budget accounting. The SLO ratio
+    # lives in its own group below with its own exclusions.)
+    # -------------------------------------------------------------------
+    - name: orders-api.red.errors
+      interval: 30s
+      rules:
+        - record: route:http_requests_errors:ratio_rate5m
+          expr: |
+            sum by (job, route) (
+              rate(http_requests_total{job="orders-api", status=~"5.."}[5m])
+            )
+            /
+            sum by (job, route) (
+              rate(http_requests_total{job="orders-api"}[5m])
+            )
+          labels:
+            service: orders-api
+
+    # -------------------------------------------------------------------
+    # RED: Duration — latency quantiles aggregated at multiple windows.
+    # histogram_quantile() needs `sum by (le, ...)` of the _bucket series as
+    # its input; omitting `le` from the `by()` clause is the single most
+    # common histogram_quantile mistake (see docs/promql-cookbook.md #7).
+    #
+    # Four windows here, not eight: dashboards want a responsive p99 (5m), a
+    # smoother trend line (30m, 1h), and a slow "has this crept up" view (6h).
+    # The SLO ladder below uses its OWN bucket-boundary-count windows, which
+    # are a different kind of series (a ratio, not a quantile) — see
+    # docs/slo-guide.md section 5 for why the SLO uses le="0.3" counting
+    # rather than histogram_quantile.
+    # -------------------------------------------------------------------
+    - name: orders-api.red.duration
+      interval: 30s
+      rules:
+        - record: route:http_request_duration_seconds:p50_5m
+          expr: |
+            histogram_quantile(0.50,
+              sum by (job, route, le) (
+                rate(http_request_duration_seconds_bucket{job="orders-api"}[5m])
+              )
+            )
+          labels: { service: orders-api, quantile: "0.5", window: 5m }
+
+        - record: route:http_request_duration_seconds:p90_5m
+          expr: |
+            histogram_quantile(0.90,
+              sum by (job, route, le) (
+                rate(http_request_duration_seconds_bucket{job="orders-api"}[5m])
+              )
+            )
+          labels: { service: orders-api, quantile: "0.9", window: 5m }
+
+        - record: route:http_request_duration_seconds:p99_5m
+          expr: |
+            histogram_quantile(0.99,
+              sum by (job, route, le) (
+                rate(http_request_duration_seconds_bucket{job="orders-api"}[5m])
+              )
+            )
+          labels: { service: orders-api, quantile: "0.99", window: 5m }
+
+        - record: route:http_request_duration_seconds:p99_30m
+          expr: |
+            histogram_quantile(0.99,
+              sum by (job, route, le) (
+                rate(http_request_duration_seconds_bucket{job="orders-api"}[30m])
+              )
+            )
+          labels: { service: orders-api, quantile: "0.99", window: 30m }
+
+        - record: route:http_request_duration_seconds:p99_1h
+          expr: |
+            histogram_quantile(0.99,
+              sum by (job, route, le) (
+                rate(http_request_duration_seconds_bucket{job="orders-api"}[1h])
+              )
+            )
+          labels: { service: orders-api, quantile: "0.99", window: 1h }
+
+        - record: route:http_request_duration_seconds:p99_6h
+          expr: |
+            histogram_quantile(0.99,
+              sum by (job, route, le) (
+                rate(http_request_duration_seconds_bucket{job="orders-api"}[6h])
+              )
+            )
+          labels: { service: orders-api, quantile: "0.99", window: 6h }
+
+        # Job-level (no route split) p99, used by HighLatencyP99 in
+        # alerts-app.yaml and by the runbook's "is it all routes or one"
+        # first diagnostic step.
+        - record: job:http_request_duration_seconds:p99_5m
+          expr: |
+            histogram_quantile(0.99,
+              sum by (job, le) (
+                rate(http_request_duration_seconds_bucket{job="orders-api"}[5m])
+              )
+            )
+          labels: { service: orders-api, quantile: "0.99", window: 5m }
+
+    # -------------------------------------------------------------------
+    # SLO — availability. The "bad event ratio" stored directly (not the
+    # good ratio) so that every alert expression below reads
+    # `ratio_rateNm > threshold` instead of `(1 - ratio) > threshold`.
+    # See docs/slo-guide.md section 5 for the exclusion-list rationale
+    # (why health checks and chaos endpoints are excluded from BOTH sides).
+    #
+    # Seven windows exist because the four-rung burn-rate ladder needs
+    # exactly these long/short pairs:
+    #   14.4x -> 1h  / 5m        6x -> 6h  / 30m
+    #    3x   -> 1d  / 2h        1x -> 3d  / 6h
+    # ratio_rate6h is reused as both the 6x long window and the 1x short
+    # window — it is defined once. ratio_rate30d exists for the dashboard's
+    # "30-day compliance" stat only; no alert reads it (a 30-day window reacts
+    # far too slowly to page on).
+    # -------------------------------------------------------------------
+    - name: slo.availability.recording
+      interval: 30s
+      rules:
+        - record: job:slo_availability_errors:ratio_rate5m
+          expr: |
+            sum by (job) (
+              rate(http_requests_total{job="orders-api", status=~"5..",
+                   route!~"/healthz|/readyz|/chaos"}[5m])
+            )
+            /
+            sum by (job) (
+              rate(http_requests_total{job="orders-api",
+                   route!~"/healthz|/readyz|/chaos"}[5m])
+            )
+          labels: { slo: availability, service: orders-api }
+
+        - record: job:slo_availability_errors:ratio_rate30m
+          expr: |
+            sum by (job) (
+              rate(http_requests_total{job="orders-api", status=~"5..",
+                   route!~"/healthz|/readyz|/chaos"}[30m])
+            )
+            /
+            sum by (job) (
+              rate(http_requests_total{job="orders-api",
+                   route!~"/healthz|/readyz|/chaos"}[30m])
+            )
+          labels: { slo: availability, service: orders-api }
+
+        - record: job:slo_availability_errors:ratio_rate1h
+          expr: |
+            sum by (job) (
+              rate(http_requests_total{job="orders-api", status=~"5..",
+                   route!~"/healthz|/readyz|/chaos"}[1h])
+            )
+            /
+            sum by (job) (
+              rate(http_requests_total{job="orders-api",
+                   route!~"/healthz|/readyz|/chaos"}[1h])
+            )
+          labels: { slo: availability, service: orders-api }
+
+        - record: job:slo_availability_errors:ratio_rate2h
+          expr: |
+            sum by (job) (
+              rate(http_requests_total{job="orders-api", status=~"5..",
+                   route!~"/healthz|/readyz|/chaos"}[2h])
+            )
+            /
+            sum by (job) (
+              rate(http_requests_total{job="orders-api",
+                   route!~"/healthz|/readyz|/chaos"}[2h])
+            )
+          labels: { slo: availability, service: orders-api }
+
+        - record: job:slo_availability_errors:ratio_rate6h
+          expr: |
+            sum by (job) (
+              rate(http_requests_total{job="orders-api", status=~"5..",
+                   route!~"/healthz|/readyz|/chaos"}[6h])
+            )
+            /
+            sum by (job) (
+              rate(http_requests_total{job="orders-api",
+                   route!~"/healthz|/readyz|/chaos"}[6h])
+            )
+          labels: { slo: availability, service: orders-api }
+
+        - record: job:slo_availability_errors:ratio_rate1d
+          expr: |
+            sum by (job) (
+              rate(http_requests_total{job="orders-api", status=~"5..",
+                   route!~"/healthz|/readyz|/chaos"}[1d])
+            )
+            /
+            sum by (job) (
+              rate(http_requests_total{job="orders-api",
+                   route!~"/healthz|/readyz|/chaos"}[1d])
+            )
+          labels: { slo: availability, service: orders-api }
+
+        - record: job:slo_availability_errors:ratio_rate3d
+          expr: |
+            sum by (job) (
+              rate(http_requests_total{job="orders-api", status=~"5..",
+                   route!~"/healthz|/readyz|/chaos"}[3d])
+            )
+            /
+            sum by (job) (
+              rate(http_requests_total{job="orders-api",
+                   route!~"/healthz|/readyz|/chaos"}[3d])
+            )
+          labels: { slo: availability, service: orders-api }
+
+        # Dashboard-only: "current 30-day SLI" stat panel and compliance
+        # tracking. Honest only once the cluster has 30 days of retention —
+        # see docs/architecture.md's retention caveat. With this repo's 7d
+        # Prometheus retention, this series silently gives a 7d-weighted
+        # number until the cluster is older than 30 days; the dashboard panel
+        # title says so explicitly.
+        - record: job:slo_availability_errors:ratio_rate30d
+          expr: |
+            sum by (job) (
+              rate(http_requests_total{job="orders-api", status=~"5..",
+                   route!~"/healthz|/readyz|/chaos"}[30d])
+            )
+            /
+            sum by (job) (
+              rate(http_requests_total{job="orders-api",
+                   route!~"/healthz|/readyz|/chaos"}[30d])
+            )
+          labels: { slo: availability, service: orders-api }
+
+    # -------------------------------------------------------------------
+    # SLO — latency. "Bad" = request slower than the 300ms SLO threshold for
+    # /api/orders and /api/checkout. Computed as a BUCKET-BOUNDARY COUNT
+    # (le="0.3" / _count), never histogram_quantile — see docs/slo-guide.md
+    # section 5 for why that distinction matters for SLO correctness. Same
+    # seven-window structure as availability, same reasoning.
+    # -------------------------------------------------------------------
+    - name: slo.latency.recording
+      interval: 30s
+      rules:
+        - record: job:slo_latency_errors:ratio_rate5m
+          expr: |
+            1 - (
+              sum by (job) (
+                rate(http_request_duration_seconds_bucket{job="orders-api",
+                     route=~"/api/orders|/api/checkout", le="0.3"}[5m])
+              )
+              /
+              sum by (job) (
+                rate(http_request_duration_seconds_count{job="orders-api",
+                     route=~"/api/orders|/api/checkout"}[5m])
+              )
+            )
+          labels: { slo: latency, service: orders-api }
+
+        - record: job:slo_latency_errors:ratio_rate30m
+          expr: |
+            1 - (
+              sum by (job) (
+                rate(http_request_duration_seconds_bucket{job="orders-api",
+                     route=~"/api/orders|/api/checkout", le="0.3"}[30m])
+              )
+              /
+              sum by (job) (
+                rate(http_request_duration_seconds_count{job="orders-api",
+                     route=~"/api/orders|/api/checkout"}[30m])
+              )
+            )
+          labels: { slo: latency, service: orders-api }
+
+        - record: job:slo_latency_errors:ratio_rate1h
+          expr: |
+            1 - (
+              sum by (job) (
+                rate(http_request_duration_seconds_bucket{job="orders-api",
+                     route=~"/api/orders|/api/checkout", le="0.3"}[1h])
+              )
+              /
+              sum by (job) (
+                rate(http_request_duration_seconds_count{job="orders-api",
+                     route=~"/api/orders|/api/checkout"}[1h])
+              )
+            )
+          labels: { slo: latency, service: orders-api }
+
+        - record: job:slo_latency_errors:ratio_rate2h
+          expr: |
+            1 - (
+              sum by (job) (
+                rate(http_request_duration_seconds_bucket{job="orders-api",
+                     route=~"/api/orders|/api/checkout", le="0.3"}[2h])
+              )
+              /
+              sum by (job) (
+                rate(http_request_duration_seconds_count{job="orders-api",
+                     route=~"/api/orders|/api/checkout"}[2h])
+              )
+            )
+          labels: { slo: latency, service: orders-api }
+
+        - record: job:slo_latency_errors:ratio_rate6h
+          expr: |
+            1 - (
+              sum by (job) (
+                rate(http_request_duration_seconds_bucket{job="orders-api",
+                     route=~"/api/orders|/api/checkout", le="0.3"}[6h])
+              )
+              /
+              sum by (job) (
+                rate(http_request_duration_seconds_count{job="orders-api",
+                     route=~"/api/orders|/api/checkout"}[6h])
+              )
+            )
+          labels: { slo: latency, service: orders-api }
+
+        - record: job:slo_latency_errors:ratio_rate1d
+          expr: |
+            1 - (
+              sum by (job) (
+                rate(http_request_duration_seconds_bucket{job="orders-api",
+                     route=~"/api/orders|/api/checkout", le="0.3"}[1d])
+              )
+              /
+              sum by (job) (
+                rate(http_request_duration_seconds_count{job="orders-api",
+                     route=~"/api/orders|/api/checkout"}[1d])
+              )
+            )
+          labels: { slo: latency, service: orders-api }
+
+        - record: job:slo_latency_errors:ratio_rate3d
+          expr: |
+            1 - (
+              sum by (job) (
+                rate(http_request_duration_seconds_bucket{job="orders-api",
+                     route=~"/api/orders|/api/checkout", le="0.3"}[3d])
+              )
+              /
+              sum by (job) (
+                rate(http_request_duration_seconds_count{job="orders-api",
+                     route=~"/api/orders|/api/checkout"}[3d])
+              )
+            )
+          labels: { slo: latency, service: orders-api }
+
+        - record: job:slo_latency_errors:ratio_rate30d
+          expr: |
+            1 - (
+              sum by (job) (
+                rate(http_request_duration_seconds_bucket{job="orders-api",
+                     route=~"/api/orders|/api/checkout", le="0.3"}[30d])
+              )
+              /
+              sum by (job) (
+                rate(http_request_duration_seconds_count{job="orders-api",
+                     route=~"/api/orders|/api/checkout"}[30d])
+              )
+            )
+          labels: { slo: latency, service: orders-api }
+
+    # -------------------------------------------------------------------
+    # Business metrics — order throughput by outcome, and total order rate.
+    # Not an SLI, but the first thing to look at when "the SLO looks fine but
+    # the business says orders dropped" — a classic sign the SLI definition
+    # itself is missing something.
+    # -------------------------------------------------------------------
+    - name: orders-api.business
+      interval: 30s
+      rules:
+        - record: job:orders_processed:rate5m
+          expr: |
+            sum by (job, status) (
+              rate(orders_processed_total{job="orders-api"}[5m])
+            )
+          labels: { service: orders-api }
+
+        - record: job:orders_processed_success_ratio:rate5m
+          expr: |
+            sum by (job) (
+              rate(orders_processed_total{job="orders-api", status="success"}[5m])
+            )
+            /
+            sum by (job) (
+              rate(orders_processed_total{job="orders-api"}[5m])
+            )
+          labels: { service: orders-api }

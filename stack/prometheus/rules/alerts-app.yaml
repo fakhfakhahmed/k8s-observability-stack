@@ -1,0 +1,201 @@
+# alerts-app.yaml — application-level alerts for orders-api.
+#
+# These are SYMPTOM alerts about this one service (as opposed to the
+# multi-window multi-burn-rate SLO alerts in slo-alerts.yaml, which are the
+# primary paging mechanism — see docs/alerting-philosophy.md for why burn-rate
+# alerts and these coexist rather than one replacing the other: these alerts
+# catch things a 5m/1h ratio can miss or catches too slowly, such as a single
+# route going fully dark or a crash loop that produces almost no failed HTTP
+# responses at all because the pod never got far enough to answer).
+#
+# Every alert carries:
+#   summary       — one line, human-first, no PromQL
+#   description   — templated with the actual value, so the first line of the
+#                    Slack message already answers "how bad, exactly"
+#   runbook_url   — a specific file in this repo; NEVER a bare "check logs"
+#   dashboard_url — jumps straight to the relevant Grafana panel
+#   severity      — critical (pages) or warning (ticket) — consumed by
+#                    stack/alertmanager/alertmanager-config.yaml's routing tree
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: orders-api-alerts
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: orders-api
+    app.kubernetes.io/part-of: k8s-observability-stack
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: orders-api.alerts
+      rules:
+        # ---------------------------------------------------------------
+        # HighErrorRate — a route-level error ratio alert. Deliberately
+        # SEPARATE from the SLO burn-rate ladder: this fires on a single
+        # route's raw 5-minute error ratio with no budget maths, and it is
+        # NOT filtered for health checks/chaos the way the SLO series is,
+        # because "this specific route is broken" is useful information even
+        # while chaos testing is intentionally breaking it. It is also faster
+        # to fire than the SLO's 14.4x/5m rung for a route with low traffic
+        # share, because it is not diluted by the other routes' good traffic.
+        # ---------------------------------------------------------------
+        - alert: HighErrorRate
+          expr: |
+            route:http_requests_errors:ratio_rate5m{job="orders-api", route!~"/healthz|/readyz|/metrics|/chaos"} > 0.05
+          for: 5m
+          labels:
+            severity: warning
+            team: orders
+            service: orders-api
+          annotations:
+            summary: "orders-api route {{ $labels.route }} is returning elevated errors"
+            description: >-
+              Route {{ $labels.route }} on orders-api has returned errors on
+              {{ $value | humanizePercentage }} of requests over the last 5m
+              (threshold 5%). Check whether this is isolated to one pod or
+              affects all replicas before escalating.
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/HighErrorRate.md"
+            dashboard_url: "http://localhost:3000/d/obs-app-red?var-route={{ $labels.route }}"
+
+        # ---------------------------------------------------------------
+        # HighLatencyP99 — job-level p99 crosses the 500ms secondary
+        # threshold (the SLO itself pages on the 300ms budget via
+        # slo-alerts.yaml; this catches the case where p99 has visibly
+        # degraded well past "merely burning budget" into "users are
+        # noticing", using the free interpolated histogram_quantile rather
+        # than a budget calculation).
+        # ---------------------------------------------------------------
+        - alert: HighLatencyP99
+          expr: |
+            job:http_request_duration_seconds:p99_5m{job="orders-api"} > 0.5
+          for: 5m
+          labels:
+            severity: warning
+            team: orders
+            service: orders-api
+          annotations:
+            summary: "orders-api p99 latency is above 500ms"
+            description: >-
+              orders-api's p99 request latency has been {{ $value | humanizeDuration }}
+              over the last 5m (threshold 500ms). Check the per-route p99
+              breakdown to localise which endpoint regressed, then open a slow
+              trace from the dashboard's exemplar link to see where the time
+              went (app code vs. inventory-service vs. payment-gateway spans).
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/HighLatencyP99.md"
+            dashboard_url: "http://localhost:3000/d/obs-app-red"
+
+        # ---------------------------------------------------------------
+        # PodCrashLooping — orders-api specific wrapper around the restart
+        # counter. kube-state-metrics' kube_pod_container_status_restarts_total
+        # is a counter; increase() over 15m catches a pod that has restarted
+        # more than twice recently, which 'for: 5m' confirms is sustained
+        # rather than a one-off.
+        # ---------------------------------------------------------------
+        - alert: PodCrashLooping
+          expr: |
+            increase(kube_pod_container_status_restarts_total{namespace="demo", pod=~"orders-api-.*"}[15m]) > 2
+          for: 5m
+          labels:
+            severity: critical
+            team: orders
+            service: orders-api
+            page: "true"
+          annotations:
+            summary: "orders-api pod {{ $labels.pod }} is crash looping"
+            description: >-
+              Container {{ $labels.container }} in pod {{ $labels.pod }} has
+              restarted {{ $value | humanize }} times in the last 15 minutes.
+              Check `kubectl describe pod` for the last termination reason
+              (OOMKilled vs. a panic vs. a failed liveness probe each point to
+              a different fix) before restarting it again.
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/PodCrashLooping.md"
+            dashboard_url: "http://localhost:3000/d/obs-k8s-cluster"
+
+        # ---------------------------------------------------------------
+        # PodNotReady — readiness, not liveness: the pod process is alive but
+        # has been refusing traffic for a sustained period. Distinct from
+        # crash-looping because a pod can fail readiness forever without ever
+        # restarting (e.g. permanently stuck behind a dependency check) —
+        # this alert is the one that catches that case.
+        # ---------------------------------------------------------------
+        - alert: PodNotReady
+          expr: |
+            kube_pod_status_ready{namespace="demo", pod=~"orders-api-.*", condition="false"} == 1
+          for: 10m
+          labels:
+            severity: warning
+            team: orders
+            service: orders-api
+          annotations:
+            summary: "orders-api pod {{ $labels.pod }} has not been Ready for 10m"
+            description: >-
+              Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} has
+              failed its readiness check continuously for 10 minutes and is
+              not receiving traffic. This is the condition that often PRECEDES
+              a crash loop — check it before PodCrashLooping fires, not after.
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/PodCrashLooping.md"
+            dashboard_url: "http://localhost:3000/d/obs-k8s-cluster"
+
+        # ---------------------------------------------------------------
+        # QueueDepthGrowing — a BUSINESS / leading-indicator alert, not an
+        # infra one. queue_depth climbing is, by design (see app/main.go's
+        # runQueueSimulator), what happens the moment errors start — it often
+        # moves before the SLO burn-rate ladder's short window has even
+        # accumulated five minutes of bad samples. deriv() estimates the
+        # per-second slope of the gauge via linear regression over the
+        # window, which is the correct tool for "is this gauge trending up",
+        # as opposed to rate()/increase() which are only valid on counters.
+        # ---------------------------------------------------------------
+        - alert: QueueDepthGrowing
+          expr: |
+            deriv(queue_depth{job="orders-api"}[10m]) > 0.05
+            and
+            queue_depth{job="orders-api"} > 5
+          for: 10m
+          labels:
+            severity: warning
+            team: orders
+            service: orders-api
+          annotations:
+            summary: "orders-api processing queue is growing"
+            description: >-
+              queue_depth on orders-api has been trending upward for 10
+              minutes (currently {{ $value | humanize }}) — the service is
+              falling behind its incoming work. This is typically a LEADING
+              indicator of an availability incident: it tends to move before
+              the error-rate SLO alert does. Correlate with orders_processed_total
+              by status to see whether orders are failing outright or merely
+              queueing.
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/ErrorBudgetBurn.md"
+            dashboard_url: "http://localhost:3000/d/obs-app-red"
+
+        # ---------------------------------------------------------------
+        # NoTrafficReceived — the degenerate case the SLO ratio cannot see.
+        # With zero requests the ratio's denominator is zero, the division
+        # yields NaN, and the series simply disappears — an absent series
+        # cannot trip a `>` comparison, so a TOTAL outage that takes traffic
+        # to zero makes the burn-rate ladder go quiet rather than fire louder.
+        # absent_over_time() is built exactly for "detect that a series
+        # stopped existing". See docs/slo-guide.md section 5 and
+        # docs/promql-cookbook.md's absent() entry.
+        # ---------------------------------------------------------------
+        - alert: NoTrafficReceived
+          expr: |
+            absent_over_time(http_requests_total{job="orders-api"}[10m])
+          for: 5m
+          labels:
+            severity: critical
+            team: orders
+            service: orders-api
+            page: "true"
+          annotations:
+            summary: "orders-api has received no traffic for 10 minutes"
+            description: >-
+              No http_requests_total samples have been seen from orders-api in
+              10 minutes. This is either a total outage (traffic dropped to
+              zero, which the ratio-based SLO alerts CANNOT detect — a ratio
+              of nothing is undefined, not 100% bad) or Prometheus has lost
+              the ability to scrape it (see TargetDown, which checks the
+              scrape itself rather than the data it would contain).
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/TargetDown.md"
+            dashboard_url: "http://localhost:3000/d/obs-app-red"

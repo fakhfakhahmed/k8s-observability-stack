@@ -1,0 +1,412 @@
+# slo-alerts.yaml — multi-window, multi-burn-rate SLO alerts.
+#
+# THIS IS THE MOST IMPORTANT FILE IN THE REPOSITORY.
+#
+# Everything else here — dashboards, runbooks, chaos endpoints, even the
+# recording rules this file consumes — exists in service of one idea: you
+# should page a human based on how fast you are burning your error budget,
+# not based on a raw error count, a CPU percentage, or a single noisy ratio.
+# The method below is the Google SRE Workbook's multi-window multi-burn-rate
+# approach (https://sre.google/workbook/alerting-on-slos/), reproduced here
+# with every number DERIVED rather than copy-pasted, so that changing the SLO
+# target or the paging policy is a documented arithmetic exercise, not a
+# guess. The full worked derivation — including a minute-by-minute simulation
+# of why the short window matters — lives in docs/slo-guide.md section 7;
+# what follows is the condensed version next to the code it justifies.
+#
+# ===========================================================================
+# PART 1 — WHAT IS A "BURN RATE"?
+# ===========================================================================
+#
+# An SLO defines an error budget: the amount of "badness" you are allowed to
+# have before you have broken your promise to users.
+#
+#   error budget = (1 - SLO target) x SLO window
+#
+# For orders-api's 99.9% availability SLO over a rolling 30-day window:
+#
+#   (1 - 0.999) x 30 days = 0.001 x 43,200 minutes = 43.2 minutes = 43m12s
+#
+# That is the ENTIRE allowance for 30 days. Burn rate asks: at the CURRENT
+# observed error ratio, how many times faster than "spend it evenly across
+# the whole month" are you going?
+#
+#                    observed error ratio
+#   burn rate  =  ---------------------------
+#                    1 - SLO target
+#
+# Burn rate 1.0 means "if this continues for the rest of the month, you will
+# land exactly on budget, with nothing to spare". Burn rate 14.4 means the
+# current error ratio would exhaust the ENTIRE 30-day budget in
+# 30 days / 14.4 = 2.08 days ≈ 50 hours. That num­ber — "the whole month's
+# slack gone in 2 days" — is the thing worth waking someone up for.
+#
+# ===========================================================================
+# PART 2 — WHY TWO WINDOWS, NOT ONE
+# ===========================================================================
+#
+# A single window forces a bad trade between speed and precision:
+#
+#   - A SHORT window (say, 5 minutes) reacts fast but is noisy: a handful of
+#     retried connections or one slow deploy can spike it over any sensible
+#     threshold for a few seconds, training on-call to distrust and silence
+#     the alert.
+#   - A LONG window (say, 1 hour) is stable and trustworthy, but it has a
+#     long memory: once bad events are inside a 1-hour rolling average, they
+#     stay there pulling the average up for up to an hour AFTER the incident
+#     is already fixed. The page keeps firing long after it should have
+#     resolved, which teaches the same lesson — stop trusting the alert — by
+#     a different route.
+#
+# The Google SRE Workbook's fix is to require BOTH at once, ANDed together:
+#
+#   long_window_ratio  > threshold   AND   short_window_ratio > threshold
+#
+# The long window supplies precision (a 30-second blip cannot push a 1-hour
+# average over a steep threshold, so you don't page on noise). The short
+# window supplies a fast RESET: the moment the short window's average drops
+# back under threshold — which happens roughly short_window/2 after the fix,
+# not long_window after it — the AND becomes false and the page resolves.
+# You get the long window's trustworthiness while firing, and the short
+# window's responsiveness when recovering. See docs/slo-guide.md section 7,
+# step 6 for a minute-by-minute table proving this with the numbers
+# `scripts/trigger-incident` actually produces.
+#
+# The short window is conventionally 1/12 of the long window (5m/1h, 30m/6h,
+# 2h/1d, 6h/3d) — short enough to reset quickly, long enough not to flap
+# during a still-recovering incident.
+#
+# ===========================================================================
+# PART 3 — DERIVING THE FOUR THRESHOLDS FROM A PAGING POLICY
+# ===========================================================================
+#
+# Do not start from "everyone uses 14.4". Start from a policy statement you
+# could defend to a manager, and solve for the burn rate that satisfies it.
+# The identity connecting them:
+#
+#   budget consumed (fraction of the WHOLE 30-day budget)
+#       =  burn rate  x  ( alerting window / SLO period )
+#
+# because burn rate 1 means "consume the whole budget in exactly one SLO
+# period" by definition, so burning at rate B for window W out of period P
+# consumes B x (W/P) of it.
+#
+# Rung 1 — "page when 2% of the 30-day budget is gone within 1 hour":
+#     0.02 = burn_rate x (1h / 720h)   =>   burn_rate = 0.02 x 720 = 14.4
+# Rung 2 — "page when 5% of the budget is gone within 6 hours":
+#     0.05 = burn_rate x (6h / 720h)   =>   burn_rate = 0.05 x 120 = 6
+# Rung 3 — "ticket when 10% of the budget is gone within 1 day":
+#     0.10 = burn_rate x (24h / 720h)  =>   burn_rate = 0.10 x 30  = 3
+# Rung 4 — "ticket when 10% of the budget is gone within 3 days":
+#     0.10 = burn_rate x (72h / 720h)  =>   burn_rate = 0.10 x 10  = 1
+#
+# Rung 4 (burn rate 1x) is the SLOW BLEED detector: a service running at
+# exactly its SLO target forever would sit right at this line without ever
+# tripping rungs 1-3. Without it, a chronic regression that is "merely" 0.1%
+# worse than the objective is invisible until the 30-day window ends and the
+# SLO report comes back red with no warning.
+#
+# ERROR-RATIO THRESHOLD for availability = burn_rate x (1 - SLO target)
+#                                         = burn_rate x 0.001
+# For the 99% latency SLO it is burn_rate x 0.01 (ten times looser, because
+# the latency budget itself is ten times bigger — 1% vs 0.1%).
+#
+#   Rung    Burn rate   Avail. threshold   Latency threshold   Long/Short   Severity
+#   ----    ---------   ----------------   -----------------   ----------   --------
+#   1       14.4x       1.44%              14.4%                1h / 5m     critical (page)
+#   2       6x          0.6%               6%                   6h / 30m    critical (page)
+#   3       3x          0.3%               3%                   1d / 2h     warning (ticket)
+#   4       1x          0.1%               1%                   3d / 6h     warning (ticket)
+#
+# Elegant property worth knowing cold for an interview: at the moment each
+# rung fires, the budget actually consumed equals the rung's DESIGNED
+# fraction (2%, 5%, 10%, 10%) REGARDLESS of how severe the underlying outage
+# is — a total outage and a mild degradation both trip the 14.4x rung having
+# spent exactly 2% of the month's budget; only the TIME to reach that point
+# differs (51.8 seconds for a total outage vs. ~17 minutes for a 5% error
+# rate). The derivation is in docs/slo-guide.md section 7, step 7.
+#
+# ===========================================================================
+# PART 4 — ONE ALERTNAME, MANY LABELS
+# ===========================================================================
+#
+# All eight rules below (4 rungs x 2 SLOs) share the alertname
+# `ErrorBudgetBurn`, distinguished only by the `slo`, `burn_rate`,
+# `long_window` and `short_window` labels. This is deliberate:
+#
+#   - Alertmanager's `group_by` (stack/alertmanager/alertmanager-config.yaml)
+#     collapses multiple rungs firing for the SAME incident into ONE
+#     notification instead of four separate pages.
+#   - The inhibition rule there suppresses the warning-severity rungs the
+#     moment a critical-severity rung for the same `service`+`slo` is
+#     firing — you want "we are in a severe burn" once, not a cascade of
+#     four separate alerts for one event.
+#   - Adding a new SLO (see docs/slo-guide.md section 9's worked
+#     checkout-latency example) means adding four more rules with a new
+#     `slo:` label value and gets Alertmanager's routing/grouping/inhibition
+#     behaviour for FREE — zero changes to alertmanager-config.yaml.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: orders-api-slo-alerts
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: orders-api
+    app.kubernetes.io/part-of: k8s-observability-stack
+    release: kube-prometheus-stack
+spec:
+  groups:
+    # =======================================================================
+    # Availability SLO — 99.9% of non-probe, non-chaos requests are non-5xx,
+    # rolling 30 days. See docs/slo-guide.md sections 1-5 for how the SLI
+    # itself (and its exclusion list) was chosen.
+    # =======================================================================
+    - name: slo.availability.rules
+      rules:
+        # --- Rung 1: 14.4x over 1h, confirmed by 5m --> PAGE -----------------
+        # Detects: a total outage in ~52 seconds, a 5% error rate in ~17 min.
+        # Spends exactly 2% of the 30-day budget (0.864 minutes) by the time
+        # it fires, no matter which.
+        - alert: ErrorBudgetBurn
+          expr: |
+            (
+              job:slo_availability_errors:ratio_rate1h{job="orders-api"} > (14.4 * 0.001)
+              and
+              job:slo_availability_errors:ratio_rate5m{job="orders-api"} > (14.4 * 0.001)
+            )
+          for: 2m
+          labels:
+            severity: critical
+            team: orders
+            slo: availability
+            service: orders-api
+            long_window: 1h
+            short_window: 5m
+            burn_rate: "14.4"
+            page: "true"
+          annotations:
+            summary: "orders-api is burning its availability error budget 14.4x faster than sustainable"
+            description: >-
+              Over the last 1h the availability error ratio is
+              {{ $value | humanizePercentage }} (page threshold 1.44%),
+              confirmed by the last 5m. At this rate the 30-day error budget
+              of 43m12s is exhausted in roughly 50 hours. This is rung 1 of 4
+              — see runbook for the full burn-rate ladder and what to check
+              first.
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/ErrorBudgetBurn.md"
+            dashboard_url: "http://localhost:3000/d/obs-slo-budget"
+
+        # --- Rung 2: 6x over 6h, confirmed by 30m --> PAGE -------------------
+        # Catches a sustained-but-less-severe degradation that rung 1's
+        # shorter window would have let decay out of its average before
+        # accumulating enough evidence; still pages, because 5% of a month's
+        # budget in six hours is still a genuine emergency.
+        - alert: ErrorBudgetBurn
+          expr: |
+            (
+              job:slo_availability_errors:ratio_rate6h{job="orders-api"} > (6 * 0.001)
+              and
+              job:slo_availability_errors:ratio_rate30m{job="orders-api"} > (6 * 0.001)
+            )
+          for: 15m
+          labels:
+            severity: critical
+            team: orders
+            slo: availability
+            service: orders-api
+            long_window: 6h
+            short_window: 30m
+            burn_rate: "6"
+            page: "true"
+          annotations:
+            summary: "orders-api is burning its availability error budget 6x faster than sustainable"
+            description: >-
+              Over the last 6h the availability error ratio is
+              {{ $value | humanizePercentage }} (page threshold 0.6%),
+              confirmed by the last 30m. At this rate the 30-day budget is
+              exhausted in 5 days. This is rung 2 of 4.
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/ErrorBudgetBurn.md"
+            dashboard_url: "http://localhost:3000/d/obs-slo-budget"
+
+        # --- Rung 3: 3x over 1d, confirmed by 2h --> TICKET ------------------
+        # No longer urgent enough to wake someone at 3am, but a 10%-of-budget
+        # trend sustained for a full day deserves attention the next business
+        # day, before it compounds into a rung-2 page.
+        - alert: ErrorBudgetBurn
+          expr: |
+            (
+              job:slo_availability_errors:ratio_rate1d{job="orders-api"} > (3 * 0.001)
+              and
+              job:slo_availability_errors:ratio_rate2h{job="orders-api"} > (3 * 0.001)
+            )
+          for: 1h
+          labels:
+            severity: warning
+            team: orders
+            slo: availability
+            service: orders-api
+            long_window: 1d
+            short_window: 2h
+            burn_rate: "3"
+            page: "false"
+          annotations:
+            summary: "orders-api availability error budget burning at 3x — ticket, not page"
+            description: >-
+              Over the last 1d the availability error ratio is
+              {{ $value | humanizePercentage }} (ticket threshold 0.3%),
+              confirmed by the last 2h. At this rate the budget is exhausted
+              in 10 days. This is rung 3 of 4 — investigate during business
+              hours.
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/ErrorBudgetBurn.md"
+            dashboard_url: "http://localhost:3000/d/obs-slo-budget"
+
+        # --- Rung 4: 1x over 3d, confirmed by 6h --> TICKET (slow bleed) -----
+        # The knife-edge rung: a service running EXACTLY at its SLO target
+        # sits right at this threshold forever. It exists to catch a chronic,
+        # low-grade regression that never trips rungs 1-3 but will, left
+        # alone, exhaust the entire month's budget by day 30 with no warning.
+        - alert: ErrorBudgetBurn
+          expr: |
+            (
+              job:slo_availability_errors:ratio_rate3d{job="orders-api"} > (1 * 0.001)
+              and
+              job:slo_availability_errors:ratio_rate6h{job="orders-api"} > (1 * 0.001)
+            )
+          for: 3h
+          labels:
+            severity: warning
+            team: orders
+            slo: availability
+            service: orders-api
+            long_window: 3d
+            short_window: 6h
+            burn_rate: "1"
+            page: "false"
+          annotations:
+            summary: "orders-api availability is tracking right at its 30-day budget (slow bleed)"
+            description: >-
+              Over the last 3d the availability error ratio is
+              {{ $value | humanizePercentage }} (threshold 0.1%), confirmed
+              by the last 6h. Left unaddressed this exhausts the full 30-day
+              budget by day 30 with no further warning from rungs 1-3. This
+              is rung 4 of 4 — the chronic-regression detector.
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/ErrorBudgetBurn.md"
+            dashboard_url: "http://localhost:3000/d/obs-slo-budget"
+
+    # =======================================================================
+    # Latency SLO — 99% of /api/orders and /api/checkout requests complete
+    # under 300ms, rolling 30 days. Identical ladder construction; only the
+    # (1 - SLO target) multiplier changes, from 0.001 to 0.01, because the
+    # latency budget is ten times looser than the availability one.
+    # =======================================================================
+    - name: slo.latency.rules
+      rules:
+        - alert: ErrorBudgetBurn
+          expr: |
+            (
+              job:slo_latency_errors:ratio_rate1h{job="orders-api"} > (14.4 * 0.01)
+              and
+              job:slo_latency_errors:ratio_rate5m{job="orders-api"} > (14.4 * 0.01)
+            )
+          for: 2m
+          labels:
+            severity: critical
+            team: orders
+            slo: latency
+            service: orders-api
+            long_window: 1h
+            short_window: 5m
+            burn_rate: "14.4"
+            page: "true"
+          annotations:
+            summary: "orders-api is burning its latency error budget 14.4x faster than sustainable"
+            description: >-
+              Over the last 1h, {{ $value | humanizePercentage }} of
+              /api/orders and /api/checkout requests exceeded 300ms (page
+              threshold 14.4%), confirmed by the last 5m. At this rate the
+              30-day budget of 7h12m is exhausted in roughly 50 hours. Pull up
+              a slow trace from the p99 panel's exemplar to see which span —
+              app code, inventory-service, or payment-gateway — is the
+              culprit.
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/ErrorBudgetBurn.md"
+            dashboard_url: "http://localhost:3000/d/obs-slo-budget"
+
+        - alert: ErrorBudgetBurn
+          expr: |
+            (
+              job:slo_latency_errors:ratio_rate6h{job="orders-api"} > (6 * 0.01)
+              and
+              job:slo_latency_errors:ratio_rate30m{job="orders-api"} > (6 * 0.01)
+            )
+          for: 15m
+          labels:
+            severity: critical
+            team: orders
+            slo: latency
+            service: orders-api
+            long_window: 6h
+            short_window: 30m
+            burn_rate: "6"
+            page: "true"
+          annotations:
+            summary: "orders-api is burning its latency error budget 6x faster than sustainable"
+            description: >-
+              Over the last 6h, {{ $value | humanizePercentage }} of requests
+              to /api/orders and /api/checkout exceeded 300ms (page threshold
+              6%), confirmed by the last 30m. Budget exhausted in 5 days at
+              this rate.
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/ErrorBudgetBurn.md"
+            dashboard_url: "http://localhost:3000/d/obs-slo-budget"
+
+        - alert: ErrorBudgetBurn
+          expr: |
+            (
+              job:slo_latency_errors:ratio_rate1d{job="orders-api"} > (3 * 0.01)
+              and
+              job:slo_latency_errors:ratio_rate2h{job="orders-api"} > (3 * 0.01)
+            )
+          for: 1h
+          labels:
+            severity: warning
+            team: orders
+            slo: latency
+            service: orders-api
+            long_window: 1d
+            short_window: 2h
+            burn_rate: "3"
+            page: "false"
+          annotations:
+            summary: "orders-api latency error budget burning at 3x — ticket, not page"
+            description: >-
+              Over the last 1d, {{ $value | humanizePercentage }} of requests
+              exceeded 300ms (ticket threshold 3%), confirmed by the last 2h.
+              Budget exhausted in 10 days at this rate.
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/ErrorBudgetBurn.md"
+            dashboard_url: "http://localhost:3000/d/obs-slo-budget"
+
+        - alert: ErrorBudgetBurn
+          expr: |
+            (
+              job:slo_latency_errors:ratio_rate3d{job="orders-api"} > (1 * 0.01)
+              and
+              job:slo_latency_errors:ratio_rate6h{job="orders-api"} > (1 * 0.01)
+            )
+          for: 3h
+          labels:
+            severity: warning
+            team: orders
+            slo: latency
+            service: orders-api
+            long_window: 3d
+            short_window: 6h
+            burn_rate: "1"
+            page: "false"
+          annotations:
+            summary: "orders-api latency is tracking right at its 30-day budget (slow bleed)"
+            description: >-
+              Over the last 3d, {{ $value | humanizePercentage }} of requests
+              exceeded 300ms (threshold 1%), confirmed by the last 6h. Left
+              unaddressed this exhausts the full 30-day latency budget by day
+              30 with no further warning from rungs 1-3.
+            runbook_url: "https://github.com/fakhfakhahmed/k8s-observability-stack/blob/main/runbooks/ErrorBudgetBurn.md"
+            dashboard_url: "http://localhost:3000/d/obs-slo-budget"

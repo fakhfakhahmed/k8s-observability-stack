@@ -1,0 +1,124 @@
+# values.yaml — Helm values for `grafana/tempo` (monolithic mode).
+#
+#   helm repo add grafana https://grafana.github.io/helm-charts
+#   helm upgrade --install tempo grafana/tempo -n monitoring -f stack/tempo/values.yaml
+#
+# MONOLITHIC, NOT MICROSERVICES MODE
+# ------------------------------------
+# Same reasoning as Loki: Tempo can be split into distributor/ingester/
+# querier/compactor microservices for independent scaling at real trace
+# volume. One pod handling 100% sampling of a demo app's traffic does not
+# need that; it needs the whole pipeline to start with one `helm install` and
+# fit comfortably on a laptop.
+tempo:
+  # --- Receivers -----------------------------------------------------------
+  # Both OTLP transports are enabled because different producers prefer
+  # different ones: app/main.go's otlptracegrpc exporter uses gRPC (port
+  # 4317); a browser-based instrumentation (OTel JS) can only use HTTP (port
+  # 4318), since browsers cannot speak raw gRPC. Shipping both costs nothing
+  # and removes a whole category of "why won't my traces arrive" questions.
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+  # --- Storage ---------------------------------------------------------------
+  # Local disk, same trade-off as Loki's filesystem backend: no object store
+  # durability, correct for a demo with a few hours of interesting traces at
+  # a time rather than months of production trace history.
+  storage:
+    trace:
+      backend: local
+      local:
+        path: /var/tempo/traces
+      wal:
+        path: /var/tempo/wal
+
+  # --- Retention -------------------------------------------------------------
+  # Traces are inherently higher-volume-per-event than metrics or even logs
+  # (a single request can be dozens of spans); 48h is enough to correlate
+  # "what happened during this week's demo/incident" without needing the
+  # multi-day retention Prometheus and Loki use for their SLO windows — a
+  # trace itself only matters while you are actively debugging it.
+  compactor:
+    compaction:
+      block_retention: 48h
+
+  # ===========================================================================
+  # METRICS-GENERATOR — the single most valuable line in this file.
+  # ===========================================================================
+  # Tempo's metrics-generator sits in the write path and derives Prometheus
+  # metrics directly from the SPANS it ingests, remote-writing them into
+  # Prometheus (configured just below) alongside everything orders-api
+  # exports on /metrics. Two processors are enabled:
+  #
+  #   service-graphs — for every client/server span pair (the parent-child
+  #     relationship between, e.g., orders-api's "payment-gateway.authorize"
+  #     client span and whatever would be payment-gateway's own server span,
+  #     were it real), emits request count, error count and latency EDGES
+  #     between services. This is how Grafana's node graph panel draws "who
+  #     calls whom, and how healthy is that call" with ZERO manual topology
+  #     configuration — it is discovered entirely from trace data.
+  #
+  #   span-metrics — for every span, emits RED metrics (request rate, error
+  #     rate, duration histogram) bucketed by service name and span name.
+  #     This means you get `traces_spanmetrics_latency` for a downstream
+  #     dependency that has NO Prometheus client library of its own at all
+  #     (in this repo, the simulated "inventory-service" and
+  #     "payment-gateway" spans are synthetic — see handleCheckout in
+  #     app/main.go — but in a real system this is exactly how you get RED
+  #     metrics for a vendor API or a legacy service you cannot instrument
+  #     directly).
+  #
+  # The payoff, stated plainly: RED metrics and a service graph, for a
+  # service that never imported prometheus/client_golang, DERIVED PURELY FROM
+  # TRACES IT DID NOT EVEN HAVE TO EMIT ON PURPOSE. This is the strongest
+  # argument for tracing as a FOUNDATIONAL signal rather than a "nice to have
+  # for slow requests" afterthought.
+  metricsGenerator:
+    enabled: true
+    remoteWriteUrl: "http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090/api/v1/write"
+    processor:
+      serviceGraphs:
+        enabled: true
+        # Span kinds that count as an "edge" in the graph — client-calls-server
+        # is the whole point; wait time is also tracked so the service graph
+        # panel can show time-spent-waiting separately from time-spent-doing.
+        histogramBuckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
+      spanMetrics:
+        enabled: true
+        histogramBuckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
+        # Dimensions promoted from span attributes into metric labels. Kept
+        # SHORT and BOUNDED for the same cardinality reasons that govern every
+        # other label in this repo — `http.route` here mirrors the exact
+        # route-template discipline enforced for http_requests_total in
+        # app/main.go's routeLabel(), not the raw path.
+        dimensions:
+          - http.route
+          - rpc.method
+
+  # Remote-write requires Prometheus to have `--enable-feature=remote-write-receiver`
+  # (or, in the Operator CRD, `prometheusSpec.enableRemoteWriteReceiver: true`)
+  # — flip that on in stack/prometheus/values.yaml alongside this setting, or
+  # the metrics-generator's writes are silently rejected with a 404.
+
+  # --- Resources ---------------------------------------------------------------
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+persistence:
+  enabled: true
+  size: 5Gi
+
+serviceMonitor:
+  enabled: true
+  labels:
+    release: kube-prometheus-stack

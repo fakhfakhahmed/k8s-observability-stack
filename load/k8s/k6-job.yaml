@@ -1,0 +1,328 @@
+# k6-job.yaml — run a k6 load script as a Kubernetes Job, no local k6 install.
+#
+# WHY A JOB, AND WHY NOT JUST PORT-FORWARD + A LOCAL k6
+# -------------------------------------------------------
+# k6 is deliberately not installed anywhere in this project's prerequisites.
+# Running it as a Job inside the cluster has two real advantages over a local
+# binary behind `kubectl port-forward`, not just convenience:
+#
+#   1. Traffic goes through the REAL ClusterIP Service and kube-proxy, the same
+#      path production traffic takes. A port-forward is a single-connection
+#      userspace proxy that becomes the bottleneck above roughly 25 VUs — you
+#      would be measuring the tunnel, not orders-api, during spike.js.
+#   2. No local prerequisite beyond kubectl — reproducible on any machine that
+#      can already reach the cluster, with no "which k6 version do you have"
+#      drift between contributors.
+#
+# This ConfigMap+Job apply directly: `kubectl apply -f load/k8s/k6-job.yaml`.
+# Because a completed Job's spec is immutable, RE-RUNNING it after a result is
+# already recorded requires deleting it first — `kubectl delete job
+# k6-load-test -n demo` — which is exactly what scripts/trigger-incident does
+# for you when it uses this path.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k6-scripts
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: k6
+    app.kubernetes.io/part-of: k8s-observability-stack
+# NOTE ON KEEPING THIS IN SYNC: this ConfigMap embeds its own copies of the
+# three scripts under load/k6/ rather than referencing them at apply time,
+# because a ConfigMap cannot include another file by reference — Kubernetes
+# manifests are not templates. If you edit load/k6/*.js, regenerate this
+# ConfigMap's data from the real source files instead of hand-editing the
+# copy below:
+#
+#   kubectl create configmap k6-scripts \
+#     --from-file=load/k6/steady.js \
+#     --from-file=load/k6/spike.js \
+#     --from-file=load/k6/failure-scenario.js \
+#     --namespace demo --dry-run=client -o yaml \
+#     | kubectl apply -f -
+#
+# (load/k6/README.md documents this same regeneration command.) The copies
+# below are kept functionally IDENTICAL to the real scripts at the time of
+# writing; if they ever drift, the command above is the source of truth, not
+# this file.
+binaryData: {}
+data:
+  steady.js: |
+    // See load/k6/steady.js for the fully-commented source of truth. This is
+    // the script executed by this Job's default args. Regenerate this
+    // ConfigMap (see the note above this data block) after editing the real
+    // file so the two never silently diverge.
+    import http from 'k6/http';
+    import { check, sleep, group } from 'k6';
+    import { Rate, Trend, Counter } from 'k6/metrics';
+    import exec from 'k6/execution';
+
+    const BASE_URL = __ENV.BASE_URL || 'http://orders-api.demo.svc.cluster.local:8080';
+    const DURATION = __ENV.DURATION || '8m';
+    const VUS = Number(__ENV.VUS || 10);
+    const THINK_MIN = Number(__ENV.THINK_MIN || 0.4);
+    const THINK_MAX = Number(__ENV.THINK_MAX || 1.2);
+
+    const checkoutLatency = new Trend('checkout_latency_ms', true);
+    const ordersCreated = new Counter('orders_created_total');
+    const businessErrors = new Rate('business_errors');
+
+    export const options = {
+      stages: [
+        { duration: '1m', target: VUS },
+        { duration: DURATION, target: VUS },
+        { duration: '1m', target: 0 },
+      ],
+      thresholds: {
+        http_req_failed: ['rate<0.001'],
+        http_req_duration: ['p(99)<300'],
+        checks: ['rate>0.99'],
+      },
+      tags: { scenario: 'steady', testid: __ENV.TESTID || 'steady-local' },
+    };
+
+    http.setResponseCallback(http.expectedStatuses({ min: 200, max: 399 }));
+
+    function headers(extra) {
+      return Object.assign({ 'User-Agent': 'k6-steady/1.0', Accept: 'application/json' }, extra || {});
+    }
+
+    export function setup() {
+      const health = http.get(`${BASE_URL}/healthz`, { timeout: '5s' });
+      if (health.status !== 200) {
+        exec.test.abort(`orders-api not reachable: GET ${BASE_URL}/healthz -> ${health.status}`);
+      }
+      console.log(`[steady] target=${BASE_URL} VUs=${VUS} duration=${DURATION}`);
+    }
+
+    export default function () {
+      const roll = Math.random();
+      if (roll < 0.6) {
+        group('GET /api/orders', function () {
+          const res = http.get(`${BASE_URL}/api/orders`, { headers: headers(), tags: { name: '/api/orders' } });
+          check(res, { 'orders: 2xx': (r) => r.status >= 200 && r.status < 300 });
+          businessErrors.add(res.status >= 500);
+        });
+      } else if (roll < 0.9) {
+        group('POST /api/checkout', function () {
+          const body = JSON.stringify({
+            customer_id: `cust-${Math.floor(Math.random() * 10000)}`,
+            items: 1 + Math.floor(Math.random() * 4),
+            amount_euros: Number((5 + Math.random() * 295).toFixed(2)),
+            currency: 'EUR',
+          });
+          const res = http.post(`${BASE_URL}/api/checkout`, body, {
+            headers: headers({ 'Content-Type': 'application/json' }),
+            tags: { name: '/api/checkout' },
+          });
+          check(res, { 'checkout: 2xx': (r) => r.status >= 200 && r.status < 300 });
+          businessErrors.add(res.status >= 500);
+          checkoutLatency.add(res.timings.duration);
+          if (res.status < 300) ordersCreated.add(1);
+        });
+      } else {
+        http.get(`${BASE_URL}/`, { headers: headers(), tags: { name: '/' } });
+      }
+      sleep(THINK_MIN + Math.random() * (THINK_MAX - THINK_MIN));
+    }
+  spike.js: |
+    // See load/k6/spike.js for the fully-commented source of truth.
+    import http from 'k6/http';
+    import { check, sleep } from 'k6';
+    import exec from 'k6/execution';
+
+    const BASE_URL = __ENV.BASE_URL || 'http://orders-api.demo.svc.cluster.local:8080';
+    const PEAK_VUS = Number(__ENV.VUS || 120);
+    const BASE_VUS = Number(__ENV.BASE_VUS || 5);
+    const PEAK_DURATION = __ENV.DURATION || '2m';
+
+    export const options = {
+      stages: [
+        { duration: '30s', target: BASE_VUS },
+        { duration: '30s', target: PEAK_VUS },
+        { duration: PEAK_DURATION, target: PEAK_VUS },
+        { duration: '30s', target: BASE_VUS },
+        { duration: '2m', target: BASE_VUS },
+      ],
+      thresholds: {
+        http_req_failed: [{ threshold: 'rate<0.05', abortOnFail: false }],
+        http_req_duration: [{ threshold: 'p(99)<1000', abortOnFail: false }],
+      },
+      tags: { scenario: 'spike', testid: __ENV.TESTID || 'spike-local' },
+    };
+
+    export function setup() {
+      const health = http.get(`${BASE_URL}/healthz`, { timeout: '5s' });
+      if (health.status !== 200) {
+        exec.test.abort(`orders-api not reachable: GET ${BASE_URL}/healthz -> ${health.status}`);
+      }
+      console.log(`[spike] target=${BASE_URL} base=${BASE_VUS} peak=${PEAK_VUS}`);
+      console.log('[spike] watch http_requests_in_flight and queue_depth on obs-app-red');
+    }
+
+    export default function () {
+      const roll = Math.random();
+      const res =
+        roll < 0.6
+          ? http.get(`${BASE_URL}/api/orders`, { tags: { name: '/api/orders' } })
+          : roll < 0.9
+          ? http.post(
+              `${BASE_URL}/api/checkout`,
+              JSON.stringify({ customer_id: 'spike', items: 1, amount_euros: 50, currency: 'EUR' }),
+              { headers: { 'Content-Type': 'application/json' }, tags: { name: '/api/checkout' } }
+            )
+          : http.get(`${BASE_URL}/`, { tags: { name: '/' } });
+      check(res, { 'responded': (r) => r.status !== 0 });
+      sleep(0.1 + Math.random() * 0.3);
+    }
+  failure-scenario.js: |
+    // See load/k6/failure-scenario.js for the fully-commented source of truth,
+    // including the full burn-rate timeline derivation. THIS copy is what
+    // scripts/trigger-incident actually runs via this Job.
+    import http from 'k6/http';
+    import { check, sleep, group } from 'k6';
+    import { Rate, Trend, Counter } from 'k6/metrics';
+    import exec from 'k6/execution';
+
+    const BASE_URL = __ENV.BASE_URL || 'http://orders-api.demo.svc.cluster.local:8080';
+    const DURATION = __ENV.DURATION || '10m';
+    const VUS = Number(__ENV.VUS || 10);
+    const ERROR_PCT = Number(__ENV.ERROR_PCT || 35);
+    const LATENCY_MS = Number(__ENV.LATENCY_MS || 900);
+    const LATENCY_PCT = Number(__ENV.LATENCY_PCT || 25);
+    const RESET_ON_EXIT = (__ENV.RESET_ON_EXIT || 'true') !== 'false';
+
+    const injectedErrors = new Rate('injected_error_rate');
+    const slowRequests = new Rate('slow_request_rate');
+    const fiveXX = new Counter('http_5xx_total');
+
+    export const options = {
+      stages: [
+        { duration: '30s', target: VUS },
+        { duration: DURATION, target: VUS },
+        { duration: '30s', target: 0 },
+      ],
+      thresholds: {
+        http_req_failed: [{ threshold: 'rate<0.001', abortOnFail: false }],
+        http_req_duration: [{ threshold: 'p(99)<300', abortOnFail: false }],
+        injected_error_rate: [{ threshold: 'rate>0.10', abortOnFail: false }],
+      },
+      tags: { scenario: 'failure', testid: __ENV.TESTID || 'failure-local' },
+    };
+
+    function chaos(path) {
+      const url = `${BASE_URL}${path}`;
+      let res = http.post(url, null, { tags: { name: 'chaos-control', control: 'true' } });
+      if (res.status === 404 || res.status === 405) res = http.get(url, { tags: { name: 'chaos-control', control: 'true' } });
+      return res;
+    }
+
+    export function setup() {
+      const health = http.get(`${BASE_URL}/healthz`, { timeout: '5s' });
+      if (health.status !== 200) {
+        exec.test.abort(`orders-api not reachable: GET ${BASE_URL}/healthz -> ${health.status}`);
+      }
+      const errRes = chaos(`/chaos/errors?pct=${ERROR_PCT}`);
+      if (errRes.status >= 400) {
+        exec.test.abort(
+          `chaos endpoints unavailable (status ${errRes.status}) - is CHAOS_ENABLED=true on the Deployment?`
+        );
+      }
+      chaos(`/chaos/latency?ms=${LATENCY_MS}&pct=${LATENCY_PCT}`);
+      console.log(`[failure] injected ${ERROR_PCT}% 5xx, ${LATENCY_PCT}% @ ${LATENCY_MS}ms`);
+      console.log('[failure] watch obs-slo-budget for the burn-rate ladder lighting up');
+      return { startedAt: new Date().toISOString() };
+    }
+
+    export default function () {
+      const roll = Math.random();
+      let res;
+      if (roll < 0.6) {
+        res = http.get(`${BASE_URL}/api/orders`, { tags: { name: '/api/orders' }, timeout: '15s' });
+      } else if (roll < 0.9) {
+        res = http.post(
+          `${BASE_URL}/api/checkout`,
+          JSON.stringify({ customer_id: 'k6', items: 1, amount_euros: 50, currency: 'EUR' }),
+          { headers: { 'Content-Type': 'application/json' }, tags: { name: '/api/checkout' }, timeout: '15s' }
+        );
+      } else {
+        res = http.get(`${BASE_URL}/`, { tags: { name: '/' }, timeout: '15s' });
+      }
+      const is5xx = res.status >= 500;
+      injectedErrors.add(is5xx);
+      if (is5xx) fiveXX.add(1);
+      slowRequests.add(res.timings.duration > 300);
+      check(res, { 'server responded': (r) => r.status !== 0 });
+      sleep(0.4 + Math.random() * 0.8);
+    }
+
+    export function teardown(data) {
+      if (!RESET_ON_EXIT) {
+        console.log('[failure] RESET_ON_EXIT=false - chaos left enabled. Run scripts/heal when done.');
+        return;
+      }
+      const res = chaos('/chaos/reset');
+      console.log(`[failure] chaos reset: status ${res.status}. Ran from ${data.startedAt} to ${new Date().toISOString()}.`);
+      if (res.status >= 400) {
+        console.error('[failure] RESET FAILED - run scripts/heal now.');
+      }
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-load-test
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: k6
+    app.kubernetes.io/part-of: k8s-observability-stack
+spec:
+  # A completed Job's pod template is immutable - re-running means `kubectl
+  # delete job k6-load-test -n demo` first (load/k6/README.md documents this).
+  backoffLimit: 0 # a load-test run that errors should be inspected, not retried
+  # Hard ceiling so a hung script (or a chaos run whose teardown never fires)
+  # cannot run forever and quietly keep burning the real error budget.
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: k6
+        app.kubernetes.io/part-of: k8s-observability-stack
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: k6
+          image: grafana/k6:0.54.0
+          # Swap which script runs by editing this args list, or see
+          # load/k6/README.md for a sed/PowerShell one-liner that does it
+          # without modifying the committed file.
+          args: ["run", "/scripts/steady.js"]
+          env:
+            - name: BASE_URL
+              value: "http://orders-api.demo.svc.cluster.local:8080"
+            # Override any of these with `kubectl set env job/k6-load-test ...`
+            # BEFORE applying (Jobs are immutable once created) or by editing
+            # this manifest directly.
+            - name: DURATION
+              value: "8m"
+            - name: VUS
+              value: "10"
+            - name: TESTID
+              value: "k8s-job"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            # k6 itself is cheap; the load it GENERATES is what costs CPU on
+            # orders-api, not on this pod.
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: scripts
+          configMap:
+            name: k6-scripts

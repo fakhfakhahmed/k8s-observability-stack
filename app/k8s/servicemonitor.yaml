@@ -1,0 +1,134 @@
+# ServiceMonitor — how Prometheus learns that orders-api exists.
+#
+# THE MENTAL MODEL
+# ----------------
+# You never edit prometheus.yml on this stack. Instead:
+#
+#   1. This ServiceMonitor is a Kubernetes object in the `demo` namespace.
+#   2. The Prometheus Operator watches ServiceMonitors cluster-wide, but only
+#      ADOPTS the ones that match the selectors on the `Prometheus` CR.
+#   3. For each adopted ServiceMonitor it generates a scrape job and writes it
+#      into the Secret that the Prometheus pod mounts as its config.
+#   4. Prometheus reloads and starts scraping the Endpoints of the selected
+#      Service.
+#
+# THE GOTCHA THAT CATCHES EVERYONE
+# --------------------------------
+# Step 2 is where targets go missing. The `Prometheus` CR created by
+# kube-prometheus-stack defaults its `serviceMonitorSelector` to
+#
+#     matchLabels:
+#       release: kube-prometheus-stack
+#
+# so a ServiceMonitor without that label is silently ignored — no error, no
+# event, no log line, it simply never appears under Status > Targets.
+#
+# This repo defends against it twice:
+#   a) `serviceMonitorSelectorNilUsesHelmValues: false` in
+#      stack/prometheus/values.yaml makes the selector nil, which means
+#      "match every ServiceMonitor in every watched namespace"; AND
+#   b) the `release: kube-prometheus-stack` label is set below anyway, so this
+#      object still works on a default installation.
+#
+# Verify adoption with:
+#   kubectl get prometheus -n monitoring -o yaml | grep -A5 serviceMonitorSelector
+#   kubectl get servicemonitor -A
+# and then look at http://localhost:9090/targets
+#
+# See docs/troubleshooting.md and runbooks/TargetDown.md.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: orders-api
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: orders-api
+    app.kubernetes.io/part-of: k8s-observability-stack
+    # (b) above — the label the default kube-prometheus-stack selector wants.
+    release: kube-prometheus-stack
+spec:
+  # Which Service to scrape. These labels must match the LABELS ON THE SERVICE
+  # object in service.yaml — not on the Pods, and not on the Deployment.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orders-api
+      app.kubernetes.io/instance: orders-api
+
+  # Which namespaces to look in. Omitting this restricts the search to the
+  # ServiceMonitor's own namespace, which happens to be right here, but being
+  # explicit documents the intent and survives a copy-paste into a chart.
+  namespaceSelector:
+    matchNames:
+      - demo
+
+  endpoints:
+    # `port` is the NAME of a port on the Service (service.yaml -> ports[].name),
+    # not a number and not the container's port name. Using a number here is a
+    # very common and very quiet failure.
+    - port: http
+      path: /metrics
+      scheme: http
+
+      # 15s matches the global scrape_interval in values.yaml. Keep them equal
+      # unless you have a reason: rate() needs at least two samples in its
+      # window, so a 5m rate() over a 15s interval has 20 samples — comfortable.
+      # A 60s interval here would leave a 1m rate() with a single sample and no
+      # result at all.
+      interval: 15s
+
+      # Must be strictly less than the interval, or a slow scrape overlaps the
+      # next one and you get "context deadline exceeded" plus gaps in the data.
+      scrapeTimeout: 10s
+
+      # honorLabels: false means that if the target exposes a `job` or
+      # `namespace` label of its own, Prometheus wins and the target's value is
+      # moved to `exported_job` / `exported_namespace`. That is what you want
+      # for an application; you would set it true only for a federation or
+      # pushgateway endpoint where the original labels are the point.
+      honorLabels: false
+
+      # Keep the application's own timestamps out of it; let the server stamp
+      # the scrape. Honouring target timestamps is a route to out-of-order
+      # samples and staleness confusion.
+      honorTimestamps: true
+
+      # --- relabelings: rewrite the TARGET's labels before scraping ---------
+      relabelings:
+        # Promote the pod name to a first-class `pod` label. Every dashboard in
+        # this repo uses it, and it is what lets you answer "is it all replicas
+        # or just one?" — the single most useful first question during an
+        # incident.
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+          action: replace
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+          action: replace
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+          action: replace
+        # Carry the app version through so you can join metrics to a release and
+        # answer "did the p99 move when we deployed?".
+        - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_version]
+          targetLabel: app_version
+          action: replace
+
+      # --- metricRelabelings: filter/rewrite the SAMPLES after scraping ------
+      # This is the cardinality brake. relabelings act on targets;
+      # metricRelabelings act on every individual sample, so this is where you
+      # drop expensive series you will never query.
+      metricRelabelings:
+        # Go's per-size GC histograms are dozens of series per pod and are only
+        # ever useful when you are profiling the runtime itself.
+        - sourceLabels: [__name__]
+          regex: "go_gc_duration_seconds.*"
+          action: drop
+        # promhttp's own counters about the /metrics endpoint.
+        - sourceLabels: [__name__]
+          regex: "promhttp_metric_handler_requests_.*"
+          action: drop
+        # Safety net: if a future code change ever leaks a high-cardinality
+        # label, drop it at ingestion rather than discovering it when the head
+        # block will not fit in memory. See LEARN.md "Cardinality".
+        - regex: "^(order_id|user_id|session_id|trace_id|request_id)$"
+          action: labeldrop

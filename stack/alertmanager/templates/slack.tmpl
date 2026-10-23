@@ -1,0 +1,60 @@
+{{/*
+  slack.tmpl — custom Slack notification templates referenced by
+  stack/alertmanager/alertmanager-config.yaml's `templates:` and each Slack
+  receiver's `title`/`text` fields.
+
+  WHY A CUSTOM TEMPLATE AT ALL
+  ----------------------------
+  Alertmanager's built-in default Slack template is a bare dump of labels and
+  annotations with no structure. An on-call engineer reading a page at 3am
+  should not have to mentally reformat a wall of key=value pairs to find the
+  two links that matter: the runbook (what do I actually do) and the
+  dashboard (what does the data look like right now). This template puts both
+  of those first-class and inline, and groups alerts so one notification can
+  represent an entire firing group rather than one alert per line with no
+  structure.
+
+  Every annotation referenced here (summary, description, runbook_url,
+  dashboard_url) is set on EVERY alert rule in
+  stack/prometheus/rules/*.yaml — this template assumes they exist. An alert
+  rule that forgets one of them renders an empty section rather than
+  erroring, which is a reasonable degrade but worth noticing during review:
+  see slo/README.md's SLO checklist item "every rule carries summary,
+  description, runbook_url, dashboard_url".
+*/}}
+
+{{/* slack.title — the one-line Slack message title / notification preview */}}
+{{ define "slack.title" }}
+{{- if eq .Status "firing" -}}
+🔴 [FIRING:{{ .Alerts.Firing | len }}] {{ .CommonLabels.alertname }}
+{{- if .CommonLabels.service }} — {{ .CommonLabels.service }}{{ end }}
+{{- if .CommonLabels.burn_rate }} (burn {{ .CommonLabels.burn_rate }}x){{ end }}
+{{- else -}}
+✅ [RESOLVED] {{ .CommonLabels.alertname }}
+{{- if .CommonLabels.service }} — {{ .CommonLabels.service }}{{ end }}
+{{- end -}}
+{{ end }}
+
+{{/* slack.text — the message body: one block per distinct alert in the group */}}
+{{ define "slack.text" }}
+{{- range .Alerts }}
+*{{ .Labels.severity | toUpper }}* | team: `{{ .Labels.team }}` | {{ if eq .Status "firing" }}firing since {{ .StartsAt.Format "15:04:05 MST" }}{{ else }}resolved at {{ .EndsAt.Format "15:04:05 MST" }}{{ end }}
+
+{{ .Annotations.summary }}
+
+{{ .Annotations.description }}
+{{ if .Labels.long_window }}📈 Window: {{ .Labels.short_window }} / {{ .Labels.long_window }}{{ end }}
+{{ if .Annotations.runbook_url }}📖 Runbook: {{ .Annotations.runbook_url }}{{ end }}
+{{ if .Annotations.dashboard_url }}📊 Dashboard: {{ .Annotations.dashboard_url }}{{ end }}
+
+---
+{{ end -}}
+{{ end }}
+
+{{/* slack.footer — shared footer, not wired into alertmanager-config.yaml by
+     default (Slack's `footer` field is separate from `text`), kept here as a
+     ready-made addition: {{ template "slack.footer" . }} in a receiver's
+     `footer:` field. */}}
+{{ define "slack.footer" }}
+Cluster: {{ .CommonLabels.cluster }} | Alertmanager | k8s-observability-stack
+{{ end }}
